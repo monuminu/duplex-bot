@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 
 import aiohttp
 
@@ -16,14 +17,41 @@ logger = logging.getLogger(__name__)
 class AzureFastTranscription(STTBase):
     """Azure Fast Transcription API — batch transcription of speech segments.
 
-    Uses the REST-based Fast Transcription endpoint which is optimized for
-    short audio segments. Ideal for VAD-segmented speech.
+    Supports both key-based and Entra ID (DefaultAzureCredential) authentication.
     """
 
     def __init__(self, speech_config: AzureSpeechConfig, stt_config: AzureSTTConfig):
         self._speech_config = speech_config
         self._stt_config = stt_config
         self._session: aiohttp.ClientSession | None = None
+
+        # Entra ID token caching
+        self._credential = None
+        self._cached_token: str = ""
+        self._token_expires_at: float = 0
+
+    def _get_endpoint(self) -> str:
+        resource = self._speech_config.resource_name
+        region = self._speech_config.region
+        if resource:
+            return f"https://{resource}.cognitiveservices.azure.com"
+        return f"https://{region}.api.cognitive.microsoft.com"
+
+    async def _get_token(self) -> str:
+        """Get a cached Entra ID token, refreshing if needed."""
+        now = time.time()
+        if self._cached_token and now < self._token_expires_at - 60:
+            return self._cached_token
+
+        if self._credential is None:
+            from azure.identity import DefaultAzureCredential
+            self._credential = DefaultAzureCredential()
+
+        token = self._credential.get_token("https://cognitiveservices.azure.com/.default")
+        self._cached_token = token.token
+        self._token_expires_at = token.expires_on
+        logger.debug("Azure Entra token refreshed (expires in %ds)", int(token.expires_on - now))
+        return self._cached_token
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -36,23 +64,33 @@ class AzureFastTranscription(STTBase):
         sample_rate: int,
         language: str = "en-US",
     ) -> Transcript:
-        """Transcribe audio using Azure Fast Transcription API.
-
-        Encodes raw PCM as WAV, sends multipart POST to the API.
-        """
+        """Transcribe audio using Azure Fast Transcription API."""
         session = await self._ensure_session()
         wav_data = pcm_to_wav(audio, sample_rate)
 
         url = (
-            f"https://{self._speech_config.region}.api.cognitive.microsoft.com"
+            f"{self._get_endpoint()}"
             f"/speechtotext/transcriptions:transcribe"
             f"?api-version={self._stt_config.api_version}"
         )
 
-        definition = {
+        definition = json.dumps({
             "locales": [language or self._stt_config.language],
             "profanityFilterMode": "None",
-        }
+            "channels": [0],
+        })
+
+        # Build auth headers
+        if self._speech_config.auth_mode == "key":
+            headers = {
+                "Ocp-Apim-Subscription-Key": self._speech_config.subscription_key,
+            }
+        else:
+            token = await self._get_token()
+            headers = {
+                "Authorization": f"Bearer {token}",
+            }
+        headers["Accept"] = "application/json"
 
         form = aiohttp.FormData()
         form.add_field(
@@ -61,16 +99,7 @@ class AzureFastTranscription(STTBase):
             filename="audio.wav",
             content_type="audio/wav",
         )
-        form.add_field(
-            "definition",
-            json.dumps(definition),
-            content_type="application/json",
-        )
-
-        headers = {
-            "Ocp-Apim-Subscription-Key": self._speech_config.subscription_key,
-            "Accept": "application/json",
-        }
+        form.add_field("definition", definition)
 
         try:
             async with session.post(url, data=form, headers=headers) as resp:
@@ -88,17 +117,20 @@ class AzureFastTranscription(STTBase):
 
     def _parse_response(self, result: dict) -> Transcript:
         """Parse the Azure Fast Transcription API response."""
-        combined_phrases = result.get("combinedPhrases", [])
-        if not combined_phrases:
+        phrases = result.get("phrases", [])
+        if not phrases:
+            combined = result.get("combinedPhrases", [])
+            if combined:
+                text = combined[0].get("text", "")
+                return Transcript(text=text, confidence=1.0)
             return Transcript(text="", confidence=0.0)
 
-        text = combined_phrases[0].get("text", "")
+        texts = [p.get("text", "") for p in phrases]
+        text = " ".join(texts).strip()
 
-        # Extract confidence from individual phrases
-        phrases = result.get("phrases", [])
         confidence = 1.0
-        if phrases:
-            confidences = [p.get("confidence", 1.0) for p in phrases]
+        confidences = [p.get("confidence", 1.0) for p in phrases]
+        if confidences:
             confidence = sum(confidences) / len(confidences)
 
         logger.debug("Azure STT: '%s' (confidence=%.3f)", text, confidence)

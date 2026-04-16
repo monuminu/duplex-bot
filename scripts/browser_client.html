@@ -126,8 +126,8 @@
 
     <script>
     const SAMPLE_RATE = 16000;
-    const CHUNK_MS = 30;
-    const SAMPLES_PER_CHUNK = SAMPLE_RATE * CHUNK_MS / 1000; // 480
+    const CHUNK_MS = 32;
+    const SAMPLES_PER_CHUNK = SAMPLE_RATE * CHUNK_MS / 1000; // 512
 
     let ws = null;
     let audioContext = null;
@@ -135,6 +135,7 @@
     let scriptProcessor = null;
     let playbackQueue = [];
     let isPlaying = false;
+    let currentSource = null;
 
     async function enumerateMics() {
         // Request permission first so device labels are available
@@ -225,6 +226,9 @@
                 source.connect(scriptProcessor);
                 scriptProcessor.connect(audioContext.destination);
                 setIndicator('listening');
+
+                // Re-enumerate mics now that we have an active stream (labels available)
+                enumerateMics();
             };
 
             ws.onmessage = (event) => {
@@ -283,6 +287,7 @@
     function playNextChunk() {
         if (playbackQueue.length === 0) {
             isPlaying = false;
+            currentSource = null;
             setIndicator('listening');
             return;
         }
@@ -303,15 +308,22 @@
         source.connect(audioContext.destination);
         source.onended = playNextChunk;
         source.start();
+        currentSource = source;
     }
 
     function handleControlMessage(msg) {
         switch (msg.type) {
             case 'clear':
-                // Barge-in: stop playback
+                // Barge-in: stop playback immediately
                 playbackQueue = [];
                 isPlaying = false;
+                if (currentSource) {
+                    currentSource.onended = null;  // Prevent chaining
+                    try { currentSource.stop(); } catch (e) {}
+                    currentSource = null;
+                }
                 setIndicator('listening');
+                console.log('Barge-in: playback cleared');
                 break;
             case 'transcript':
                 addMessage(msg.text, 'user');
@@ -349,6 +361,11 @@
         ws = null;
         playbackQueue = [];
         isPlaying = false;
+        if (currentSource) {
+            currentSource.onended = null;
+            try { currentSource.stop(); } catch (e) {}
+            currentSource = null;
+        }
         setIndicator('');
         document.getElementById('connectBtn').disabled = false;
         document.getElementById('disconnectBtn').disabled = true;

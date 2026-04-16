@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator
 
 import azure.cognitiveservices.speech as speechsdk
@@ -21,13 +22,18 @@ class AzureSpeechTTS(TTSBase):
     """Azure Speech SDK TTS with streaming output.
 
     Uses PullAudioOutputStream + thread executor to bridge the synchronous
-    SDK into asyncio.
+    SDK into asyncio. Supports both key-based and Entra ID authentication.
     """
 
     def __init__(self, speech_config: AzureSpeechConfig, tts_config: AzureTTSConfig):
         self._speech_config = speech_config
         self._tts_config = tts_config
         self._sample_rate = self._parse_sample_rate(tts_config.output_format)
+
+        # Entra ID token caching
+        self._credential = None
+        self._cached_token: str = ""
+        self._token_expires_at: float = 0
 
     def _parse_sample_rate(self, output_format: str) -> int:
         """Extract sample rate from Azure output format string."""
@@ -39,11 +45,36 @@ class AzureSpeechTTS(TTSBase):
             return 8000
         return 16000
 
+    def _get_entra_token(self) -> str:
+        """Get a cached Entra ID token, refreshing if needed."""
+        now = time.time()
+        if self._cached_token and now < self._token_expires_at - 60:
+            return self._cached_token
+
+        if self._credential is None:
+            from azure.identity import DefaultAzureCredential
+            self._credential = DefaultAzureCredential()
+
+        token = self._credential.get_token("https://cognitiveservices.azure.com/.default")
+        self._cached_token = token.token
+        self._token_expires_at = token.expires_on
+        logger.debug("Azure Entra TTS token refreshed")
+        return self._cached_token
+
     def _get_speech_config(self) -> speechsdk.SpeechConfig:
-        config = speechsdk.SpeechConfig(
-            subscription=self._speech_config.subscription_key,
-            region=self._speech_config.region,
-        )
+        if self._speech_config.auth_mode == "key":
+            config = speechsdk.SpeechConfig(
+                subscription=self._speech_config.subscription_key,
+                region=self._speech_config.region,
+            )
+        else:
+            # Entra ID token auth
+            token = self._get_entra_token()
+            config = speechsdk.SpeechConfig(
+                auth_token=token,
+                region=self._speech_config.region,
+            )
+
         config.speech_synthesis_voice_name = self._tts_config.voice_name
         # Set output format
         format_map = {
@@ -107,10 +138,12 @@ class AzureSpeechTTS(TTSBase):
             audio_config=audio_config,
         )
 
+        logger.info("Azure TTS: synthesizing '%s' (voice=%s)", text[:60], config.speech_synthesis_voice_name)
         result = synthesizer.speak_text(text)
 
         if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
             audio_data = result.audio_data
+            logger.info("Azure TTS: synthesis complete, %d bytes of audio", len(audio_data))
             cumulative_ms = 0.0
 
             # Split into chunks and push to queue
@@ -130,10 +163,12 @@ class AzureSpeechTTS(TTSBase):
             # Signal completion
             loop.call_soon_threadsafe(queue.put_nowait, None)
         else:
+            cancellation = getattr(result, "cancellation_details", None)
             logger.error(
-                "Azure TTS failed: reason=%s, details=%s",
+                "Azure TTS failed: reason=%s, error_code=%s, details=%s",
                 result.reason,
-                result.cancellation_details if hasattr(result, "cancellation_details") else "N/A",
+                getattr(cancellation, "error_code", "N/A") if cancellation else "N/A",
+                getattr(cancellation, "error_details", "N/A") if cancellation else "N/A",
             )
             loop.call_soon_threadsafe(queue.put_nowait, None)
 

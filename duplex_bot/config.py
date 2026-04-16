@@ -7,11 +7,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class AzureSpeechConfig(BaseModel):
     subscription_key: str = ""
     region: str = "eastus"
+    resource_name: str = ""
+    auth_mode: str = "entra"  # "key" or "entra"
 
 
 class AzureSTTConfig(BaseModel):
     language: str = "en-US"
-    api_version: str = "2024-11-15"
+    api_version: str = "2025-10-15"
 
 
 class AzureTTSConfig(BaseModel):
@@ -33,6 +35,7 @@ class LLMConfig(BaseModel):
     model: str = "gpt-4o"
     temperature: float = 0.7
     max_tokens: int = 1024
+    api_style: str = "openai"  # "openai" or "azure"
 
 
 class VADConfig(BaseModel):
@@ -41,7 +44,7 @@ class VADConfig(BaseModel):
     min_silence_duration_ms: int = 300
     prefix_padding_ms: int = 300
     sample_rate: int = 16000
-    chunk_size_ms: int = 30
+    chunk_size_ms: int = 32
 
 
 class EndOfTurnConfig(BaseModel):

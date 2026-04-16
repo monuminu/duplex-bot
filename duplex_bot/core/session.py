@@ -88,7 +88,7 @@ class VoiceSession:
         self._tasks: list[asyncio.Task] = []
         self._is_agent_speaking = False
         self._current_llm_task: asyncio.Task | None = None
-        self._current_tts_task: asyncio.Task | None = None
+        self._tts_cancel = asyncio.Event()  # Set to cancel in-flight TTS synthesis
         self._shutdown_event = asyncio.Event()
 
         # Timing for EIBC→FSB
@@ -158,11 +158,23 @@ class VoiceSession:
 
     async def _inbound_loop(self, websocket: WebSocket) -> None:
         """Read messages from WebSocket and route to appropriate queues."""
+        _audio_chunk_count = 0
         try:
             while not self._shutdown_event.is_set():
                 event = await self._adapter.receive(websocket)
 
                 if isinstance(event, AudioChunk):
+                    _audio_chunk_count += 1
+                    if _audio_chunk_count == 1:
+                        logger.info(
+                            "Session %s: first audio chunk received (%d bytes, %dHz)",
+                            self.session_id, len(event.data), event.sample_rate,
+                        )
+                    elif _audio_chunk_count % 500 == 0:
+                        logger.debug(
+                            "Session %s: %d audio chunks received (q=%d)",
+                            self.session_id, _audio_chunk_count, self._audio_in_q.qsize(),
+                        )
                     event.session_id = self.session_id
                     # Resample to internal rate if needed
                     if event.sample_rate != self._config.internal_sample_rate:
@@ -205,31 +217,40 @@ class VoiceSession:
     async def _vad_loop(self) -> None:
         """Process audio chunks through VAD and emit speech events."""
         try:
+            _vad_count = 0
             while not self._shutdown_event.is_set():
                 chunk = await self._audio_in_q.get()
+                _vad_count += 1
+                if _vad_count == 1:
+                    logger.info("VAD loop: processing first chunk (%d bytes)", len(chunk.data))
 
-                span = self._tracer.start_span("vad") if self._tracer else None
-                vad_event = await self._vad_stream.process(chunk)
+                try:
+                    span = self._tracer.start_span("vad") if self._tracer else None
+                    vad_event = await self._vad_stream.process(chunk)
 
-                if isinstance(vad_event, SpeechStarted):
-                    # Emit interrupt signal for barge-in
-                    if self._is_agent_speaking:
-                        vad_event.interrupt.session_id = self.session_id
-                        vad_event.interrupt.playback_position_ms = (
-                            self._truncation.current_playback_ms
-                        )
-                        await self._interrupt_q.put(vad_event.interrupt)
+                    if isinstance(vad_event, SpeechStarted):
+                        # Emit interrupt signal for barge-in
+                        if self._is_agent_speaking:
+                            vad_event.interrupt.session_id = self.session_id
+                            vad_event.interrupt.playback_position_ms = (
+                                self._truncation.current_playback_ms
+                            )
+                            await self._interrupt_q.put(vad_event.interrupt)
 
-                elif isinstance(vad_event, SpeechEnded):
-                    vad_event.segment.session_id = self.session_id
-                    self._input_committed_at_ms = time.monotonic() * 1000
-                    await self._speech_q.put(vad_event.segment)
+                    elif isinstance(vad_event, SpeechEnded):
+                        vad_event.segment.session_id = self.session_id
+                        self._input_committed_at_ms = time.monotonic() * 1000
+                        await self._speech_q.put(vad_event.segment)
 
-                if span and self._tracer:
-                    self._tracer.end_span("vad", {
-                        "is_speech": isinstance(vad_event, (SpeechStarted, SpeechEnded)),
-                        "vad_state": self._vad_stream.state.name,
-                    })
+                    if span and self._tracer:
+                        self._tracer.end_span("vad", {
+                            "is_speech": isinstance(vad_event, (SpeechStarted, SpeechEnded)),
+                            "vad_state": self._vad_stream.state.name,
+                        })
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("VAD processing error (state=%s)", self._vad_stream.state.name)
 
         except asyncio.CancelledError:
             pass
@@ -440,6 +461,7 @@ class VoiceSession:
                     continue
 
                 self._is_agent_speaking = True
+                self._tts_cancel.clear()
 
                 span_id = None
                 if self._tracer:
@@ -448,11 +470,20 @@ class VoiceSession:
                 tts_start = time.monotonic() * 1000
                 first_byte = True
 
+                logger.info("TTS loop: synthesizing '%s'", text[:60])
+                _chunk_count = 0
                 try:
                     async for audio_chunk in self._tts.synthesize_stream(text):
+                        # Check if interrupted (barge-in)
+                        if self._tts_cancel.is_set():
+                            logger.info("TTS: cancelled mid-stream after %d chunks", _chunk_count)
+                            break
+
+                        _chunk_count += 1
                         if first_byte:
                             tts_ttfb = time.monotonic() * 1000 - tts_start
                             first_byte = False
+                            logger.info("TTS: first audio chunk (%d bytes, TTFB=%.0fms)", len(audio_chunk.audio), tts_ttfb)
 
                             # Record EIBC→FSB if we have the committed timestamp
                             if self._input_committed_at_ms > 0:
@@ -471,6 +502,8 @@ class VoiceSession:
 
                         # Send to client
                         await self._adapter.send_audio(websocket, audio_chunk)
+
+                    logger.info("TTS: sent %d audio chunks for '%s'", _chunk_count, text[:40])
 
                 except asyncio.CancelledError:
                     logger.debug("TTS cancelled (barge-in)")
@@ -502,21 +535,24 @@ class VoiceSession:
                         "playback_position_ms": interrupt.playback_position_ms,
                     })
 
-                # 1. Send clear to client
+                # 1. Cancel in-flight TTS synthesis immediately
+                self._tts_cancel.set()
+
+                # 2. Send clear to client
                 await self._adapter.send_clear(websocket)
 
-                # 2. Cancel current LLM generation
+                # 3. Cancel current LLM generation
                 if self._current_llm_task and not self._current_llm_task.done():
                     self._current_llm_task.cancel()
 
-                # 3. Drain TTS text queue
+                # 4. Drain TTS text queue
                 while not self._tts_text_q.empty():
                     try:
                         self._tts_text_q.get_nowait()
                     except asyncio.QueueEmpty:
                         break
 
-                # 4. Auto-truncation: update conversation history
+                # 5. Auto-truncation: update conversation history
                 heard_text = self._truncation.get_heard_text(
                     interrupt.playback_position_ms
                 )
@@ -527,7 +563,7 @@ class VoiceSession:
                             "agent_response_heard": heard_text,
                         })
 
-                # 5. Reset state
+                # 6. Reset state
                 self._is_agent_speaking = False
                 self._truncation.reset()
 
