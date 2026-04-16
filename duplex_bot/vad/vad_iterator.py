@@ -1,5 +1,4 @@
 import copy
-import torch
 import numpy as np
 
 
@@ -18,7 +17,8 @@ class VADIterator:
 
         Parameters
         ----------
-        model: preloaded .jit/.onnx silero VAD model
+        model: preloaded .onnx silero VAD model (SileroVADOnnx or similar with
+               __call__(x, sr) and reset_states())
 
         threshold: float (default - 0.5)
             Speech threshold. Silero VAD outputs speech probabilities for each audio chunk, probabilities ABOVE this value are considered as SPEECH.
@@ -41,7 +41,6 @@ class VADIterator:
         self.buffer = []
         self.start_pad_buffer = []
 
-
         if sampling_rate not in [8000, 16000]:
             raise ValueError(
                 "VADIterator does not support sampling rates other than [8000, 16000]"
@@ -58,23 +57,22 @@ class VADIterator:
         self.temp_end = 0
         self.current_sample = 0
 
-    @torch.no_grad()
     def __call__(self, x):
         """
-        x: torch.Tensor
+        x: numpy.ndarray
             audio chunk (see examples in repo)
 
         return_seconds: bool (default - False)
             whether return timestamps in seconds (default - samples)
         """
 
-        if not torch.is_tensor(x):
+        if not isinstance(x, np.ndarray):
             try:
-                x = torch.Tensor(x)
+                x = np.array(x, dtype=np.float32)
             except Exception:
-                raise TypeError("Audio cannot be casted to tensor. Cast it manually")
+                raise TypeError("Audio cannot be cast to numpy array. Cast it manually")
 
-        window_size_samples = len(x[0]) if x.dim() == 2 else len(x)
+        window_size_samples = len(x[0]) if x.ndim == 2 else len(x)
         self.current_sample += window_size_samples
 
         speech_prob = self.model(x, self.sampling_rate).item()
@@ -92,10 +90,6 @@ class VADIterator:
             if not self.temp_end:
                 self.temp_end = self.current_sample
             if self.current_sample - self.temp_end >= self.min_silence_samples:
-                # if self.current_sample - self.temp_end > self.speech_pad_samples:
-                #     return None
-            # else:
-                # end of speak
                 self.temp_end = 0
                 self.triggered = False
                 spoken_utterance = self.buffer
@@ -106,9 +100,10 @@ class VADIterator:
             self.buffer.append(x)
 
         self.start_pad_buffer.append(x)
-        self.start_pad_buffer = self.start_pad_buffer[-int(self.speech_pad_samples//window_size_samples):]
+        self.start_pad_buffer = self.start_pad_buffer[-int(self.speech_pad_samples // window_size_samples):]
 
         return None
+
 
 def int2float(sound):
     """
@@ -116,15 +111,10 @@ def int2float(sound):
     """
     sound = sound.astype("float32")
     sound *= 1 / 32768
-    # sound = sound.squeeze()  # depends on the use case
     return sound
 
-def float2int(sound):
-    """
-    Taken from
-    """
 
-    # sound = sound.squeeze()  # depends on the use case
+def float2int(sound):
     sound *= 32768
     sound = np.clip(sound, -32768, 32767)
     return sound.astype("int16")
