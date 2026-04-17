@@ -1,50 +1,58 @@
 from __future__ import annotations
 
-import asyncio
+import json
 import logging
+import time
 
 import aiohttp
+from azure.identity.aio import DefaultAzureCredential
+
 from duplex_bot.config import AzureSpeechConfig, AzureSTTConfig
 from duplex_bot.core.audio import pcm_to_wav
 from duplex_bot.core.events import Transcript
 from duplex_bot.stt.base import STTBase
-from azure.core.credentials import AzureKeyCredential
-from azure.identity import DefaultAzureCredential
-from azure.ai.transcription import TranscriptionClient
-from azure.ai.transcription.models import TranscriptionContent, TranscriptionOptions
 
 logger = logging.getLogger(__name__)
 
 
-
 class AzureFastTranscription(STTBase):
-    """Azure Fast Transcription API — batch transcription of speech segments.
-
-    Supports both key-based and Entra ID (DefaultAzureCredential) authentication.
-    """
+    """Azure Fast Transcription via REST — fully async with connection reuse."""
 
     def __init__(self, speech_config: AzureSpeechConfig, stt_config: AzureSTTConfig):
         self._speech_config = speech_config
         self._stt_config = stt_config
         self._session: aiohttp.ClientSession | None = None
-        if self._speech_config.auth_mode == "key":
-            self._credential = AzureKeyCredential(self._speech_config.api_key)
-        else:
-            self._credential = DefaultAzureCredential(exclude_managed_identity_credential=True)
-        self.client = TranscriptionClient(endpoint=self._get_endpoint(), credential=self._credential)
-        self._cached_token: str = ""
-        self._token_expires_at: float = 0
-        
-    def _get_endpoint(self) -> str:
+
+        self._use_key = speech_config.auth_mode == "key"
+        if not self._use_key:
+            self._credential = DefaultAzureCredential(
+                exclude_managed_identity_credential=True,
+            )
+            self._cached_token: str = ""
+            self._token_expires_at: float = 0
+
+        self._base_url = self._build_base_url()
+
+    def _build_base_url(self) -> str:
         resource = self._speech_config.resource_name
         region = self._speech_config.region
-        if resource:
-            return f"https://{resource}.cognitiveservices.azure.com"
-        return f"https://{region}.api.cognitive.microsoft.com"
-    
+        return f"https://{resource}.cognitiveservices.azure.com/speechtotext/transcriptions:transcribe?api-version=2025-10-15"
+
+    async def _get_bearer_token(self) -> str:
+        now = time.time()
+        if self._cached_token and now < self._token_expires_at - 60:
+            return self._cached_token
+        token = await self._credential.get_token(
+            "https://cognitiveservices.azure.com/.default"
+        )
+        self._cached_token = token.token
+        self._token_expires_at = token.expires_on
+        return self._cached_token
+
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            connector = aiohttp.TCPConnector(keepalive_timeout=300)
+            self._session = aiohttp.ClientSession(connector=connector)
         return self._session
 
     async def transcribe(
@@ -53,20 +61,52 @@ class AzureFastTranscription(STTBase):
         sample_rate: int,
         language: str = "en-US",
     ) -> Transcript:
-        """Transcribe audio using Azure Fast Transcription API."""
+        t0 = time.monotonic()
+        session = await self._ensure_session()
         wav_data = pcm_to_wav(audio, sample_rate)
-        options = TranscriptionOptions(locales=[language])
-        request_content = TranscriptionContent(
-            definition=options,
-            audio=("audio.wav", wav_data, "audio/wav"),
+        t_wav = time.monotonic()
+
+        headers: dict[str, str] = {}
+        if self._use_key:
+            headers["Ocp-Apim-Subscription-Key"] = self._speech_config.subscription_key
+        else:
+            headers["Authorization"] = f"Bearer {await self._get_bearer_token()}"
+        t_auth = time.monotonic()
+
+        definition = json.dumps({"locales": [language]})
+        form = aiohttp.FormData()
+        form.add_field(
+            "definition", definition, content_type="application/json",
         )
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, self.client.transcribe, request_content)
-        text = result.combined_phrases[0].text if result.combined_phrases else ""
-        duration_milliseconds = result.duration_milliseconds
-        logger.debug(f"Transcription result: '{text}' (duration: {duration_milliseconds} ms)")
-        return Transcript(text=text, confidence=0)
+        form.add_field(
+            "audio", wav_data, filename="audio.wav", content_type="audio/wav",
+        )
+
+        async with session.post(
+            self._base_url, data=form, headers=headers,
+        ) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                logger.error("STT request failed (%d): %s", resp.status, body[:200])
+                return Transcript(text="", confidence=0.0)
+
+            result = await resp.json()
+        t_api = time.monotonic()
+
+        combined = result.get("combinedPhrases", [])
+        text = combined[0].get("text", "") if combined else ""
+        logger.info(
+            "STT breakdown: wav=%.0fms auth=%.0fms api=%.0fms total=%.0fms audio=%dB",
+            (t_wav - t0) * 1000,
+            (t_auth - t_wav) * 1000,
+            (t_api - t_auth) * 1000,
+            (t_api - t0) * 1000,
+            len(wav_data),
+        )
+        return Transcript(text=text, confidence=0.0)
 
     async def close(self) -> None:
         if self._session and not self._session.closed:
             await self._session.close()
+        if not self._use_key:
+            await self._credential.close()
