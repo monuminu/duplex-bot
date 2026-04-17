@@ -6,10 +6,11 @@ class VADIterator:
     def __init__(
         self,
         model,
-        threshold: float = 0.5,
+        threshold: float = 0.46,
         sampling_rate: int = 16000,
-        min_silence_duration_ms: int = 100,
-        speech_pad_ms: int = 30,
+        min_silence_duration_ms: int = 600,
+        speech_pad_ms: int = 200,
+        config=None,
     ):
         """
         Mainly taken from https://github.com/snakers4/silero-vad
@@ -17,22 +18,30 @@ class VADIterator:
 
         Parameters
         ----------
-        model: preloaded .onnx silero VAD model (SileroVADOnnx or similar with
-               __call__(x, sr) and reset_states())
+        model: preloaded .onnx silero VAD model
 
-        threshold: float (default - 0.5)
-            Speech threshold. Silero VAD outputs speech probabilities for each audio chunk, probabilities ABOVE this value are considered as SPEECH.
-            It is better to tune this parameter for each dataset separately, but "lazy" 0.5 is pretty good for most datasets.
+        threshold: float (default - 0.46)
+            Speech probability threshold. Values ABOVE this are considered SPEECH.
 
         sampling_rate: int (default - 16000)
-            Currently silero VAD models support 8000 and 16000 sample rates
+            Currently silero VAD models support 8000 and 16000 sample rates.
 
-        min_silence_duration_ms: int (default - 100 milliseconds)
-            In the end of each speech chunk wait for min_silence_duration_ms before separating it
+        min_silence_duration_ms: int (default - 600 milliseconds)
+            Wait for this duration of silence before splitting speech chunks.
 
-        speech_pad_ms: int (default - 30 milliseconds)
-            Final speech chunks are padded by speech_pad_ms each side
+        speech_pad_ms: int (default - 200 milliseconds)
+            Final speech chunks are padded by speech_pad_ms each side.
+
+        config: VADConfig (optional)
+            If provided, overrides threshold, sampling_rate,
+            min_silence_duration_ms, and speech_pad_ms from config.
         """
+
+        if config is not None:
+            threshold = config.activation_threshold
+            sampling_rate = config.sample_rate
+            min_silence_duration_ms = config.min_silence_duration_ms
+            speech_pad_ms = config.speech_pad_ms
 
         self.model = model
         self.threshold = threshold

@@ -48,6 +48,7 @@ class SileroVAD(VADBase):
 
         def _load():
             if not self._model_path.exists():
+                logger.warning("Silero VAD model not found at %s. Downloading...", self._model_path)
                 _download_model(self._model_path)
             opts = ort.SessionOptions()
             opts.inter_op_num_threads = 1

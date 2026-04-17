@@ -39,11 +39,14 @@ class LLMConfig(BaseModel):
 
 
 class VADConfig(BaseModel):
-    activation_threshold: float = 0.5
-    min_speech_duration_ms: int = 250
-    min_silence_duration_ms: int = 300
-    prefix_padding_ms: int = 300
+    activation_threshold: float = 0.46
     sample_rate: int = 16000
+    min_speech_duration_ms: int = 300
+    max_speech_duration_s: int = 20
+    min_silence_duration_ms: int = 600
+    window_size_samples: int = 512
+    speech_pad_ms: int = 200
+    prefix_padding_ms: int = 200
     chunk_size_ms: int = 32
 
 

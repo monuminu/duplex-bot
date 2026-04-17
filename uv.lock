@@ -167,6 +167,20 @@ wheels = [
 ]
 
 [[package]]
+name = "azure-ai-transcription"
+version = "1.0.0b3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "azure-core" },
+    { name = "isodate" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f3/d4/f1448c181deb34fec2947b1d1778fa51cddf606b47368288cd5a9f9c630d/azure_ai_transcription-1.0.0b3.tar.gz", hash = "sha256:932d8d20e29393bb9e4d474e220b49b8cef132b76c92a947d30ded0389da2d16", size = 66625 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/49/14/23584307743a561b1202e02c6e8507827023d1266015695bb6499a77d4c9/azure_ai_transcription-1.0.0b3-py3-none-any.whl", hash = "sha256:36e1eaf0fef78a02280ee486c72fe72872c342129ea2ac56419be509ee49d366", size = 62504 },
+]
+
+[[package]]
 name = "azure-cognitiveservices-speech"
 version = "1.49.1"
 source = { registry = "https://pypi.org/simple" }
@@ -474,6 +488,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
+    { name = "azure-ai-transcription" },
     { name = "azure-cognitiveservices-speech" },
     { name = "azure-identity" },
     { name = "elevenlabs" },
@@ -498,6 +513,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.10.0" },
+    { name = "azure-ai-transcription" },
     { name = "azure-cognitiveservices-speech", specifier = ">=1.40.0" },
     { name = "azure-identity", specifier = ">=1.17.0" },
     { name = "elevenlabs", specifier = ">=1.9.0" },
@@ -775,6 +791,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/72/34/14ca021ce8e5dfedc35312d08ba8bf51fdd999c576889fc2c24cb97f4f10/iniconfig-2.3.0.tar.gz", hash = "sha256:c76315c77db068650d49c5b56314774a7804df16fee4402c1f19d6d15d8c4730", size = 20503 }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/cb/b1/3846dd7f199d53cb17f49cba7e651e9ce294d8497c8c150530ed11865bb8/iniconfig-2.3.0-py3-none-any.whl", hash = "sha256:f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12", size = 7484 },
+]
+
+[[package]]
+name = "isodate"
+version = "0.7.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/54/4d/e940025e2ce31a8ce1202635910747e5a87cc3a6a6bb2d00973375014749/isodate-0.7.2.tar.gz", hash = "sha256:4cd1aa0f43ca76f4a6c6c0292a85f40b35ec2e43e315b59f06e6d32171a953e6", size = 29705 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/15/aa/0aca39a37d3c7eb941ba736ede56d689e7be91cab5d9ca846bde3999eba6/isodate-0.7.2-py3-none-any.whl", hash = "sha256:28009937d8031054830160fce6d409ed342816b543597cece116d966c6d99e15", size = 22320 },
 ]
 
 [[package]]

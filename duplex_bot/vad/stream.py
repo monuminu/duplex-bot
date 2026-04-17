@@ -62,9 +62,11 @@ class VADStream:
         self._speech_duration_ms: float = 0
         self._silence_duration_ms: float = 0
 
+        self._max_speech_duration_ms: float = config.max_speech_duration_s * 1000
+
         # Calculate prefix buffer capacity (number of chunks)
         chunk_duration_ms = config.chunk_size_ms
-        self._prefix_capacity = max(1, config.prefix_padding_ms // chunk_duration_ms)
+        self._prefix_capacity = max(1, config.speech_pad_ms // chunk_duration_ms)
 
     async def process(self, chunk: AudioChunk) -> VADStreamEvent | None:
         """Process an audio chunk and potentially emit a VAD event.
@@ -125,6 +127,10 @@ class VADStream:
                     self._state = VADState.SPEECH_ENDING
                     logger.debug("VAD: SPEECH_ACTIVE → SPEECH_ENDING (silence=%.0fms)", self._silence_duration_ms)
                     return self._emit_speech_segment()
+
+            if self._speech_duration_ms >= self._max_speech_duration_ms:
+                logger.debug("VAD: SPEECH_ACTIVE → SPEECH_ENDING (max duration %.0fms)", self._speech_duration_ms)
+                return self._emit_speech_segment()
 
         elif self._state == VADState.SPEECH_ENDING:
             # Already emitted, should not happen — reset
