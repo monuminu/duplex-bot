@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -40,68 +41,66 @@ class ElevenLabsTTS(TTSBase):
             return 44100
         return 16000
 
+    def _build_ws_url(self, voice_id: str, auto_mode: bool = False) -> str:
+        url = ELEVENLABS_WS_URL.format(voice_id=voice_id)
+        url += f"?model_id={self._config.model_id}"
+        url += f"&output_format={self._config.output_format}"
+        if auto_mode:
+            url += "&auto_mode=true"
+        return url
+
     async def synthesize_stream(
         self,
         text: str,
         voice: str | None = None,
     ) -> AsyncIterator[TTSAudioChunk]:
-        """Synthesize text via ElevenLabs WebSocket streaming API."""
+        """Synthesize a complete text string via ElevenLabs WebSocket."""
         if not text.strip():
             return
 
         voice_id = voice or self._config.voice_id
-        url = ELEVENLABS_WS_URL.format(voice_id=voice_id)
-        url += f"?model_id={self._config.model_id}"
-        url += f"&output_format={self._config.output_format}"
-        url += f"&optimize_streaming_latency={self._config.optimize_streaming_latency}"
-
+        url = self._build_ws_url(voice_id)
         cumulative_ms = 0.0
 
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.ws_connect(url) as ws:
-                    # Send BOS (beginning of stream) message
-                    bos_message = {
+                    await ws.send_json({
                         "text": " ",
                         "voice_settings": {
                             "stability": 0.5,
                             "similarity_boost": 0.75,
                         },
                         "xi_api_key": self._config.api_key,
-                    }
-                    await ws.send_json(bos_message)
+                    })
 
-                    # Send the text
                     await ws.send_json({
                         "text": text,
                         "try_trigger_generation": True,
                     })
-
-                    # Send EOS (end of stream) to flush
                     await ws.send_json({"text": ""})
 
-                    # Receive audio chunks
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             data = json.loads(msg.data)
-
                             if data.get("audio"):
-                                import base64
                                 audio_bytes = base64.b64decode(data["audio"])
-                                chunk_duration = pcm_duration_ms(audio_bytes, self._sample_rate)
+                                chunk_duration = pcm_duration_ms(
+                                    audio_bytes, self._sample_rate
+                                )
                                 cumulative_ms += chunk_duration
-
                                 yield TTSAudioChunk(
                                     audio=audio_bytes,
                                     text_span=text,
                                     cumulative_duration_ms=cumulative_ms,
                                     sample_rate=self._sample_rate,
                                 )
-
                             if data.get("isFinal"):
                                 break
-
-                        elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
+                        elif msg.type in (
+                            aiohttp.WSMsgType.ERROR,
+                            aiohttp.WSMsgType.CLOSED,
+                        ):
                             logger.error("ElevenLabs WS error: %s", msg.data)
                             break
 
@@ -113,23 +112,20 @@ class ElevenLabsTTS(TTSBase):
         text_chunks: AsyncIterator[str],
         voice: str | None = None,
     ) -> AsyncIterator[TTSAudioChunk]:
-        """Send text incrementally as it arrives from the LLM.
+        """Stream text tokens to ElevenLabs as LLM produces them.
 
-        This is the ultra-low-latency path: text tokens are streamed
-        to ElevenLabs as the LLM produces them, and audio is streamed back.
+        Opens one WebSocket session per response. Text sending and audio
+        receiving run concurrently — audio starts flowing back as soon as
+        ElevenLabs has enough context, not after all text is sent.
         """
         voice_id = voice or self._config.voice_id
-        url = ELEVENLABS_WS_URL.format(voice_id=voice_id)
-        url += f"?model_id={self._config.model_id}"
-        url += f"&output_format={self._config.output_format}"
-        url += f"&optimize_streaming_latency={self._config.optimize_streaming_latency}"
-
+        url = self._build_ws_url(voice_id, auto_mode=False)
         cumulative_ms = 0.0
+        audio_q: asyncio.Queue[TTSAudioChunk | None] = asyncio.Queue()
 
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.ws_connect(url) as ws:
-                    # BOS
                     await ws.send_json({
                         "text": " ",
                         "voice_settings": {
@@ -139,54 +135,64 @@ class ElevenLabsTTS(TTSBase):
                         "xi_api_key": self._config.api_key,
                     })
 
-                    # Start receiver task
-                    audio_queue: asyncio.Queue[TTSAudioChunk | None] = asyncio.Queue()
+                    async def _send():
+                        try:
+                            async for chunk in text_chunks:
+                                if chunk:
+                                    await ws.send_json({"text": chunk})
+                            await ws.send_json({"text": ""})
+                        except asyncio.CancelledError:
+                            pass
 
-                    async def receive_audio():
+                    async def _recv():
                         nonlocal cumulative_ms
                         try:
                             async for msg in ws:
                                 if msg.type == aiohttp.WSMsgType.TEXT:
                                     data = json.loads(msg.data)
                                     if data.get("audio"):
-                                        import base64
-                                        audio_bytes = base64.b64decode(data["audio"])
-                                        chunk_duration = pcm_duration_ms(audio_bytes, self._sample_rate)
-                                        cumulative_ms += chunk_duration
-                                        await audio_queue.put(TTSAudioChunk(
-                                            audio=audio_bytes,
-                                            text_span="",
-                                            cumulative_duration_ms=cumulative_ms,
-                                            sample_rate=self._sample_rate,
-                                        ))
+                                        audio_bytes = base64.b64decode(
+                                            data["audio"]
+                                        )
+                                        dur = pcm_duration_ms(
+                                            audio_bytes, self._sample_rate
+                                        )
+                                        cumulative_ms += dur
+                                        await audio_q.put(
+                                            TTSAudioChunk(
+                                                audio=audio_bytes,
+                                                text_span="",
+                                                cumulative_duration_ms=cumulative_ms,
+                                                sample_rate=self._sample_rate,
+                                            )
+                                        )
                                     if data.get("isFinal"):
                                         break
-                                elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
+                                elif msg.type in (
+                                    aiohttp.WSMsgType.ERROR,
+                                    aiohttp.WSMsgType.CLOSED,
+                                ):
                                     break
+                        except asyncio.CancelledError:
+                            pass
                         finally:
-                            await audio_queue.put(None)
+                            await audio_q.put(None)
 
-                    recv_task = asyncio.create_task(receive_audio())
+                    send_task = asyncio.create_task(_send())
+                    recv_task = asyncio.create_task(_recv())
 
-                    # Send text chunks as they arrive
-                    async for text_chunk in text_chunks:
-                        if text_chunk:
-                            await ws.send_json({
-                                "text": text_chunk,
-                                "try_trigger_generation": True,
-                            })
-
-                    # EOS
-                    await ws.send_json({"text": ""})
-
-                    # Yield received audio
-                    while True:
-                        chunk = await audio_queue.get()
-                        if chunk is None:
-                            break
-                        yield chunk
-
-                    await recv_task
+                    try:
+                        while True:
+                            chunk = await audio_q.get()
+                            if chunk is None:
+                                break
+                            yield chunk
+                    finally:
+                        send_task.cancel()
+                        recv_task.cancel()
+                        await asyncio.gather(
+                            send_task, recv_task, return_exceptions=True
+                        )
 
         except Exception:
             logger.exception("ElevenLabs incremental TTS failed")

@@ -11,7 +11,7 @@ from duplex_bot.adapters.exotel import ExotelAdapter
 from duplex_bot.config import AppConfig
 from duplex_bot.core.session import VoiceSession
 from duplex_bot.llm.function_calling import FunctionRegistry
-from duplex_bot.llm.openai_compat import OpenAICompatibleLLM
+from duplex_bot.llm.openai_responses import OpenAIResponsesLLM
 from duplex_bot.observability.tracer import SessionTracer
 from duplex_bot.stt.azure_fast import AzureFastTranscription
 from duplex_bot.tts.azure_speech import AzureSpeechTTS
@@ -83,7 +83,7 @@ async def websocket_endpoint(websocket: WebSocket, adapter_name: str) -> None:
     # Create per-session components
     vad_stream = VADStream(_vad_model, _config.vad, session_id)
     stt = AzureFastTranscription(_config.azure_speech, _config.azure_stt)
-    llm = OpenAICompatibleLLM(_config.llm)
+    llm = OpenAIResponsesLLM(_config.llm)
     tts = _create_tts(_config)
 
     tracer = None

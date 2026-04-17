@@ -30,7 +30,7 @@ class AzureFastTranscription(STTBase):
         if self._speech_config.auth_mode == "key":
             self._credential = AzureKeyCredential(self._speech_config.api_key)
         else:
-            self._credential = DefaultAzureCredential()
+            self._credential = DefaultAzureCredential(exclude_managed_identity_credential=True)
         self.client = TranscriptionClient(endpoint=self._get_endpoint(), credential=self._credential)
         self._cached_token: str = ""
         self._token_expires_at: float = 0

@@ -58,7 +58,7 @@ class OpenAICompatibleLLM(LLMBase):
 
         if self._credential is None:
             from azure.identity import DefaultAzureCredential
-            self._credential = DefaultAzureCredential()
+            self._credential = DefaultAzureCredential(exclude_managed_identity_credential=True)
 
         token = self._credential.get_token("https://cognitiveservices.azure.com/.default")
         self._cached_token = token.token

@@ -8,6 +8,7 @@ class AzureSpeechConfig(BaseModel):
     subscription_key: str = ""
     region: str = "eastus"
     resource_name: str = ""
+    resource_id: str = ""
     auth_mode: str = "entra"  # "key" or "entra"
 
 
@@ -36,6 +37,7 @@ class LLMConfig(BaseModel):
     temperature: float = 0.7
     max_tokens: int = 1024
     api_style: str = "openai"  # "openai" or "azure"
+    api_format: str = "responses"  # "chat_completions" or "responses"
 
 
 class VADConfig(BaseModel):
@@ -88,6 +90,8 @@ class AppConfig(BaseSettings):
     langfuse: LangfuseConfig = LangfuseConfig()
 
     tts_provider: str = "azure"
+    tts_streaming_mode: str = "incremental"  # "incremental" (token-by-token) or "sentence" (accumulate sentences)
 
     system_prompt: str = "You are a helpful voice assistant. Keep your responses concise and conversational."
+    welcome_message: str = ""
     internal_sample_rate: int = 16000

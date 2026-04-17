@@ -18,7 +18,8 @@ dependencies = [
     "azure-cognitiveservices-speech>=1.40.0",
     "elevenlabs>=1.9.0",
     "langfuse>=2.50.0",
-    "azure-ai-transcription"
+    "azure-ai-transcription",
+    "openai"
 ]
 
 [project.optional-dependencies]

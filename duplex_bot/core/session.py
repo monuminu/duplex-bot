@@ -91,6 +91,9 @@ class VoiceSession:
         self._tts_cancel = asyncio.Event()  # Set to cancel in-flight TTS synthesis
         self._shutdown_event = asyncio.Event()
 
+        # Persistent TTS session — created once, reused for welcome + all responses
+        self._tts_session = self._tts.create_session()
+
         # Timing for EIBC→FSB
         self._input_committed_at_ms: float = 0
         self._websocket: WebSocket | None = None
@@ -110,6 +113,9 @@ class VoiceSession:
             )
 
         logger.info("Session %s started (adapter=%s)", self.session_id, self._adapter.name)
+
+        if self._config.welcome_message:
+            await self._speak_welcome(websocket)
 
         self._tasks = [
             asyncio.create_task(self._inbound_loop(websocket), name="inbound"),
@@ -145,6 +151,7 @@ class VoiceSession:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
+        await self._tts_session.close()
 
         if self._tracer:
             self._tracer.end_session(
@@ -153,6 +160,28 @@ class VoiceSession:
             )
 
         logger.info("Session %s shut down", self.session_id)
+
+    async def _speak_welcome(self, websocket: WebSocket) -> None:
+        """Synthesize and send the welcome message, pre-warming the TTS connection."""
+        text = self._config.welcome_message
+        logger.info("Session %s: speaking welcome message", self.session_id)
+
+        self._conversation.add_assistant_message(text)
+        await self._adapter.send_text(websocket, "agent_text", text)
+
+        tts_start = time.monotonic() * 1000
+        first_byte = True
+
+        async for audio_chunk in self._tts_session.synthesize_stream(text):
+            if first_byte:
+                tts_ttfb = time.monotonic() * 1000 - tts_start
+                first_byte = False
+                logger.info(
+                    "Welcome TTS: first audio chunk (TTFB=%.0fms)", tts_ttfb
+                )
+            await self._adapter.send_audio(websocket, audio_chunk)
+
+        logger.info("Session %s: welcome message sent", self.session_id)
 
     # ─── Pipeline Loops ─────────────────────────────────────────────
 
@@ -318,10 +347,11 @@ class VoiceSession:
                     self._turn_detector._last_transcript_time or time.monotonic() * 1000
                 )
 
-                is_done = await self._turn_detector.check_end_of_turn(
-                    silence_ms,
-                    self._conversation.get_context(),
-                )
+                # is_done = await self._turn_detector.check_end_of_turn(
+                #     silence_ms,
+                #     self._conversation.get_context(),
+                # )
+                is_done = True
 
                 if is_done:
                     user_text = self._turn_detector.get_accumulated_text()
@@ -351,7 +381,12 @@ class VoiceSession:
         self._current_llm_task = asyncio.create_task(self._llm_generate())
 
     async def _llm_generate(self) -> None:
-        """Stream LLM response, split into sentences, push to TTS queue."""
+        """Stream LLM response and push text to TTS queue.
+
+        In "incremental" mode, each token is pushed immediately.
+        In "sentence" mode, tokens are buffered and flushed at sentence
+        boundaries for better TTS prosody.
+        """
         messages = self._conversation.get_messages()
         tools = self._function_executor._registry.tool_schemas if self._function_executor._registry.has_tools else None
 
@@ -364,31 +399,34 @@ class VoiceSession:
         full_response = ""
         sentence_buffer = ""
         tool_calls: list[ToolCallFragment] = []
+        incremental = self._config.tts_streaming_mode == "incremental"
 
         try:
             async for chunk in self._llm.generate_stream(messages, tools):
+                print(chunk.text, end="", flush=True)  # Debug: print tokens as they arrive
                 if first_token_at is None and chunk.text:
                     first_token_at = time.monotonic() * 1000
 
                 if chunk.text:
                     full_response += chunk.text
-                    # Accumulate and extract complete sentences
-                    sentences, sentence_buffer = accumulate_sentences(
-                        sentence_buffer, chunk.text
-                    )
-                    for sentence in sentences:
-                        await self._tts_text_q.put(sentence)
+
+                    if incremental:
+                        await self._tts_text_q.put(chunk.text)
+                    else:
+                        sentences, sentence_buffer = accumulate_sentences(
+                            sentence_buffer, chunk.text
+                        )
+                        for sentence in sentences:
+                            await self._tts_text_q.put(sentence)
 
                 if chunk.is_final:
-                    # Flush remaining buffer
-                    if sentence_buffer.strip():
+                    if not incremental and sentence_buffer.strip():
                         await self._tts_text_q.put(sentence_buffer.strip())
                         sentence_buffer = ""
 
                     if chunk.tool_calls:
                         tool_calls = chunk.tool_calls
 
-                    # Signal TTS that this response is done
                     await self._tts_text_q.put("")  # Empty string = done marker
 
         except asyncio.CancelledError:
@@ -448,75 +486,193 @@ class VoiceSession:
                 )
 
     async def _tts_loop(self, websocket: WebSocket) -> None:
-        """Read sentences from TTS queue, synthesize, and send audio."""
+        """Synthesize audio from the TTS text queue and send to client.
+
+        Two modes controlled by ``config.tts_streaming_mode``:
+
+        * **incremental** — tokens are streamed to TTS as they arrive from
+          the LLM via a single ``synthesize_stream_incremental`` session per
+          response.  Lowest latency; requires a TTS provider that supports
+          input streaming (ElevenLabs).
+        * **sentence** — the LLM loop buffers tokens into complete sentences
+          and each sentence is synthesized independently via
+          ``synthesize_stream``.  Better prosody; works with any provider.
+        """
+        incremental = self._config.tts_streaming_mode == "incremental"
+
         try:
             while not self._shutdown_event.is_set():
-                text = await self._tts_text_q.get()
-
-                if not text:
-                    # Done marker — end of response
-                    self._is_agent_speaking = False
-                    self._truncation.reset()
-                    continue
-
-                self._is_agent_speaking = True
-                self._tts_cancel.clear()
-
-                span_id = None
-                if self._tracer:
-                    span_id = self._tracer.start_span("tts")
-
-                tts_start = time.monotonic() * 1000
-                first_byte = True
-
-                logger.info("TTS loop: synthesizing '%s'", text[:60])
-                _chunk_count = 0
-                try:
-                    async for audio_chunk in self._tts.synthesize_stream(text):
-                        # Check if interrupted (barge-in)
-                        if self._tts_cancel.is_set():
-                            logger.info("TTS: cancelled mid-stream after %d chunks", _chunk_count)
-                            break
-
-                        _chunk_count += 1
-                        if first_byte:
-                            tts_ttfb = time.monotonic() * 1000 - tts_start
-                            first_byte = False
-                            logger.info("TTS: first audio chunk (%d bytes, TTFB=%.0fms)", len(audio_chunk.audio), tts_ttfb)
-
-                            # Record EIBC→FSB if we have the committed timestamp
-                            if self._input_committed_at_ms > 0:
-                                eibc_to_fsb = time.monotonic() * 1000 - self._input_committed_at_ms
-                                if self._tracer:
-                                    self._tracer.record_event("eibc_to_fsb", {
-                                        "eibc_to_fsb_ms": eibc_to_fsb,
-                                    })
-                                logger.info("EIBC→FSB: %.0fms", eibc_to_fsb)
-                                self._input_committed_at_ms = 0
-
-                        # Track for truncation
-                        self._truncation.record_segment(
-                            text, audio_chunk.cumulative_duration_ms
-                        )
-
-                        # Send to client
-                        await self._adapter.send_audio(websocket, audio_chunk)
-
-                    logger.info("TTS: sent %d audio chunks for '%s'", _chunk_count, text[:40])
-
-                except asyncio.CancelledError:
-                    logger.debug("TTS cancelled (barge-in)")
-                    raise
-
-                if self._tracer and span_id:
-                    self._tracer.end_span("tts", {
-                        "tts_ttfb_ms": tts_ttfb if not first_byte else 0,
-                        "tts_provider": self._config.tts_provider,
-                        "text": text,
-                    })
-
+                if incremental:
+                    await self._tts_loop_incremental(websocket)
+                else:
+                    await self._tts_loop_sentence(websocket)
         except asyncio.CancelledError:
             pass
+
+    # ── incremental mode ────────────────────────────────────────────
+
+    async def _tts_loop_incremental(self, websocket: WebSocket) -> None:
+        """One iteration: stream an entire response through a single TTS session."""
+        first_token = await self._tts_text_q.get()
+
+        if not first_token:
+            self._is_agent_speaking = False
+            self._truncation.reset()
+            return
+
+        self._is_agent_speaking = True
+        self._tts_cancel.clear()
+        accumulated_text = first_token
+
+        async def _token_stream():
+            nonlocal accumulated_text
+            yield first_token
+            while True:
+                token = await self._tts_text_q.get()
+                if not token:
+                    return
+                if self._tts_cancel.is_set():
+                    while not self._tts_text_q.empty():
+                        try:
+                            if not self._tts_text_q.get_nowait():
+                                break
+                        except asyncio.QueueEmpty:
+                            break
+                    return
+                accumulated_text += token
+                yield token
+
+        if self._tracer:
+            self._tracer.start_span("tts")
+
+        tts_start = time.monotonic() * 1000
+        first_byte = True
+        tts_ttfb = 0.0
+        _chunk_count = 0
+
+        try:
+            async for audio_chunk in self._tts.synthesize_stream_incremental(
+                _token_stream()
+            ):
+                if self._tts_cancel.is_set():
+                    logger.info("TTS: cancelled mid-stream after %d chunks", _chunk_count)
+                    break
+
+                _chunk_count += 1
+                if first_byte:
+                    tts_ttfb = time.monotonic() * 1000 - tts_start
+                    first_byte = False
+                    logger.info(
+                        "TTS: first audio chunk (%d bytes, TTFB=%.0fms)",
+                        len(audio_chunk.audio),
+                        tts_ttfb,
+                    )
+                    if self._input_committed_at_ms > 0:
+                        eibc_to_fsb = time.monotonic() * 1000 - self._input_committed_at_ms
+                        if self._tracer:
+                            self._tracer.record_event("eibc_to_fsb", {
+                                "eibc_to_fsb_ms": eibc_to_fsb,
+                            })
+                        logger.info("EIBC→FSB: %.0fms", eibc_to_fsb)
+                        self._input_committed_at_ms = 0
+
+                self._truncation.record_segment(
+                    accumulated_text, audio_chunk.cumulative_duration_ms
+                )
+                await self._adapter.send_audio(websocket, audio_chunk)
+
+            logger.info("TTS: sent %d audio chunks", _chunk_count)
+
+        except asyncio.CancelledError:
+            logger.debug("TTS cancelled (barge-in)")
+            raise
+
+        if self._tracer:
+            self._tracer.end_span("tts", {
+                "tts_ttfb_ms": tts_ttfb,
+                "tts_provider": self._config.tts_provider,
+                "text": accumulated_text[:200],
+            })
+
+        self._is_agent_speaking = False
+        self._truncation.reset()
+
+    # ── sentence mode ───────────────────────────────────────────────
+
+    async def _tts_loop_sentence(self, websocket: WebSocket) -> None:
+        """Process all sentences for one response over a pooled TTS connection."""
+        text = await self._tts_text_q.get()
+
+        if not text:
+            self._is_agent_speaking = False
+            self._truncation.reset()
+            return
+
+        self._is_agent_speaking = True
+        self._tts_cancel.clear()
+
+        while text:
+            if self._tts_cancel.is_set():
+                break
+
+            if self._tracer:
+                self._tracer.start_span("tts")
+
+            tts_start = time.monotonic() * 1000
+            first_byte = True
+            tts_ttfb = 0.0
+            _chunk_count = 0
+
+            logger.info("TTS: synthesizing '%s'", text)
+
+            try:
+                async for audio_chunk in self._tts_session.synthesize_stream(text):
+                    if self._tts_cancel.is_set():
+                        logger.info("TTS: cancelled mid-stream after %d chunks", _chunk_count)
+                        break
+
+                    _chunk_count += 1
+                    if first_byte:
+                        tts_ttfb = time.monotonic() * 1000 - tts_start
+                        first_byte = False
+                        logger.info(
+                            "TTS: first audio chunk (%d bytes, TTFB=%.0fms)",
+                            len(audio_chunk.audio),
+                            tts_ttfb,
+                        )
+                        if self._input_committed_at_ms > 0:
+                            eibc_to_fsb = time.monotonic() * 1000 - self._input_committed_at_ms
+                            if self._tracer:
+                                self._tracer.record_event("eibc_to_fsb", {
+                                    "eibc_to_fsb_ms": eibc_to_fsb,
+                                })
+                            logger.info("EIBC→FSB: %.0fms", eibc_to_fsb)
+                            self._input_committed_at_ms = 0
+
+                    self._truncation.record_segment(
+                        text, audio_chunk.cumulative_duration_ms
+                    )
+                    await self._adapter.send_audio(websocket, audio_chunk)
+
+                logger.info("TTS: sent %d audio chunks for '%s'", _chunk_count, text[:40])
+
+            except asyncio.CancelledError:
+                logger.debug("TTS cancelled (barge-in)")
+                raise
+
+            if self._tracer:
+                self._tracer.end_span("tts", {
+                    "tts_ttfb_ms": tts_ttfb,
+                    "tts_provider": self._config.tts_provider,
+                    "text": text,
+                })
+
+            if self._tts_cancel.is_set():
+                break
+            text = await self._tts_text_q.get()
+
+        self._is_agent_speaking = False
+        self._truncation.reset()
 
     async def _interrupt_handler(self, websocket: WebSocket) -> None:
         """Handle barge-in interrupts."""

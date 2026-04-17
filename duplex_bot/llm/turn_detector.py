@@ -52,7 +52,7 @@ class TurnDetector:
 
         # Tier 1: Hard silence threshold
         if silence_ms >= self._config.silence_threshold_ms:
-            logger.debug("Turn complete: hard silence threshold (%.0fms)", silence_ms)
+            logger.info("Turn complete: hard silence threshold (%.0fms)", silence_ms)
             return True
 
         # Tier 2: Semantic check after shorter silence
@@ -62,7 +62,7 @@ class TurnDetector:
                     self._accumulated_text, context
                 )
                 is_done = confidence >= self._config.semantic_confidence_threshold
-                logger.debug(
+                logger.info(
                     "Semantic EOT: confidence=%.3f, done=%s, text='%s'",
                     confidence,
                     is_done,
