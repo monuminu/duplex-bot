@@ -229,13 +229,12 @@ class VoiceSession:
                     vad_event = await self._vad_stream.process(chunk)
 
                     if isinstance(vad_event, SpeechStarted):
-                        # Emit interrupt signal for barge-in
-                        if self._is_agent_speaking:
-                            vad_event.interrupt.session_id = self.session_id
-                            vad_event.interrupt.playback_position_ms = (
-                                self._truncation.current_playback_ms
-                            )
-                            await self._interrupt_q.put(vad_event.interrupt)
+                        # Always send clear when speech is detected
+                        vad_event.interrupt.session_id = self.session_id
+                        vad_event.interrupt.playback_position_ms = (
+                            self._truncation.current_playback_ms
+                        )
+                        await self._interrupt_q.put(vad_event.interrupt)
 
                     elif isinstance(vad_event, SpeechEnded):
                         vad_event.segment.session_id = self.session_id
