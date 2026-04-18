@@ -37,7 +37,7 @@ class LLMConfig(BaseModel):
     temperature: float = 0.7
     max_tokens: int = 1024
     api_style: str = "openai"  # "openai" or "azure"
-    api_format: str = "responses"  # "chat_completions" or "responses"
+    api_format: str = "responses"  # "chat_completions", "responses", or "realtime"
 
 
 class VADConfig(BaseModel):

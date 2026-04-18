@@ -11,8 +11,10 @@ from duplex_bot.adapters.exotel import ExotelAdapter
 from duplex_bot.config import AppConfig
 from duplex_bot.core.azure_token import AzureTokenProvider
 from duplex_bot.core.session import VoiceSession
+from duplex_bot.llm.base import LLMBase
 from duplex_bot.llm.function_calling import FunctionRegistry
 from duplex_bot.llm.openai_responses import OpenAIResponsesLLM
+from duplex_bot.llm.realtime import OpenAIRealtimeLLM
 from duplex_bot.observability.tracer import SessionTracer
 from duplex_bot.stt.azure_fast import AzureFastTranscription
 from duplex_bot.tts.azure_speech import AzureSpeechTTS
@@ -49,6 +51,13 @@ def _create_adapter(adapter_name: str) -> TelephonyAdapter:
     if adapter_cls is None:
         raise ValueError(f"Unknown adapter: {adapter_name}. Available: {list(adapters.keys())}")
     return adapter_cls()
+
+
+def _create_llm(config: AppConfig, token_provider: AzureTokenProvider | None = None) -> LLMBase:
+    """Create an LLM provider based on config.api_format."""
+    if config.llm.api_format == "realtime":
+        return OpenAIRealtimeLLM(config.llm, token_provider)
+    return OpenAIResponsesLLM(config.llm, token_provider)
 
 
 def _create_tts(config: AppConfig, token_provider: AzureTokenProvider | None = None) -> TTSBase:
@@ -90,7 +99,7 @@ async def websocket_endpoint(websocket: WebSocket, adapter_name: str) -> None:
     # Create per-session components
     vad_stream = VADStream(_vad_model, _config.vad, session_id)
     stt = AzureFastTranscription(_config.azure_speech, _config.azure_stt, token_provider)
-    llm = OpenAIResponsesLLM(_config.llm, token_provider)
+    llm = _create_llm(_config, token_provider)
     tts = _create_tts(_config, token_provider)
 
     tracer = None
