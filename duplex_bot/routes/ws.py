@@ -9,6 +9,7 @@ from duplex_bot.adapters.base import TelephonyAdapter
 from duplex_bot.adapters.browser import BrowserAdapter
 from duplex_bot.adapters.exotel import ExotelAdapter
 from duplex_bot.config import AppConfig
+from duplex_bot.core.azure_token import AzureTokenProvider
 from duplex_bot.core.session import VoiceSession
 from duplex_bot.llm.function_calling import FunctionRegistry
 from duplex_bot.llm.openai_responses import OpenAIResponsesLLM
@@ -50,12 +51,12 @@ def _create_adapter(adapter_name: str) -> TelephonyAdapter:
     return adapter_cls()
 
 
-def _create_tts(config: AppConfig) -> TTSBase:
+def _create_tts(config: AppConfig, token_provider: AzureTokenProvider | None = None) -> TTSBase:
     """Create a TTS provider based on config."""
     if config.tts_provider == "elevenlabs":
         return ElevenLabsTTS(config.elevenlabs)
     else:
-        return AzureSpeechTTS(config.azure_speech, config.azure_tts)
+        return AzureSpeechTTS(config.azure_speech, config.azure_tts, token_provider)
 
 
 @router.websocket("/ws/{adapter_name}")
@@ -80,11 +81,17 @@ async def websocket_endpoint(websocket: WebSocket, adapter_name: str) -> None:
         await websocket.close(code=1008, reason=str(e))
         return
 
+    # Acquire a shared Azure token for this session (used by STT, TTS, LLM)
+    token_provider: AzureTokenProvider | None = None
+    if _config.azure_speech.auth_mode != "key":
+        token_provider = AzureTokenProvider()
+        await token_provider.initialize()
+
     # Create per-session components
     vad_stream = VADStream(_vad_model, _config.vad, session_id)
-    stt = AzureFastTranscription(_config.azure_speech, _config.azure_stt)
-    llm = OpenAIResponsesLLM(_config.llm)
-    tts = _create_tts(_config)
+    stt = AzureFastTranscription(_config.azure_speech, _config.azure_stt, token_provider)
+    llm = OpenAIResponsesLLM(_config.llm, token_provider)
+    tts = _create_tts(_config, token_provider)
 
     tracer = None
     if _config.langfuse.enabled and _config.langfuse.public_key:

@@ -5,10 +5,10 @@ import logging
 import time
 
 import aiohttp
-from azure.identity.aio import DefaultAzureCredential
 
 from duplex_bot.config import AzureSpeechConfig, AzureSTTConfig
 from duplex_bot.core.audio import pcm_to_wav
+from duplex_bot.core.azure_token import AzureTokenProvider
 from duplex_bot.core.events import Transcript
 from duplex_bot.stt.base import STTBase
 
@@ -18,18 +18,18 @@ logger = logging.getLogger(__name__)
 class AzureFastTranscription(STTBase):
     """Azure Fast Transcription via REST — fully async with connection reuse."""
 
-    def __init__(self, speech_config: AzureSpeechConfig, stt_config: AzureSTTConfig):
+    def __init__(
+        self,
+        speech_config: AzureSpeechConfig,
+        stt_config: AzureSTTConfig,
+        token_provider: AzureTokenProvider | None = None,
+    ):
         self._speech_config = speech_config
         self._stt_config = stt_config
         self._session: aiohttp.ClientSession | None = None
+        self._token_provider = token_provider
 
         self._use_key = speech_config.auth_mode == "key"
-        if not self._use_key:
-            self._credential = DefaultAzureCredential(
-                exclude_managed_identity_credential=True,
-            )
-            self._cached_token: str = ""
-            self._token_expires_at: float = 0
 
         self._base_url = self._build_base_url()
 
@@ -38,22 +38,26 @@ class AzureFastTranscription(STTBase):
         region = self._speech_config.region
         return f"https://{resource}.cognitiveservices.azure.com/speechtotext/transcriptions:transcribe?api-version=2025-10-15"
 
-    async def _get_bearer_token(self) -> str:
-        now = time.time()
-        if self._cached_token and now < self._token_expires_at - 60:
-            return self._cached_token
-        token = await self._credential.get_token(
-            "https://cognitiveservices.azure.com/.default"
-        )
-        self._cached_token = token.token
-        self._token_expires_at = token.expires_on
-        return self._cached_token
+    def _get_bearer_token(self) -> str:
+        if self._token_provider is None:
+            raise RuntimeError("No token provider configured for Entra auth")
+        return self._token_provider.token
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             connector = aiohttp.TCPConnector(keepalive_timeout=300)
             self._session = aiohttp.ClientSession(connector=connector)
         return self._session
+
+    async def warmup(self) -> None:
+        """Pre-establish TCP+TLS connection to Azure STT endpoint."""
+        session = await self._ensure_session()
+        url = f"https://{self._speech_config.resource_name}.cognitiveservices.azure.com/"
+        try:
+            async with session.head(url) as _:
+                pass
+        except Exception:
+            pass
 
     async def transcribe(
         self,
@@ -70,7 +74,7 @@ class AzureFastTranscription(STTBase):
         if self._use_key:
             headers["Ocp-Apim-Subscription-Key"] = self._speech_config.subscription_key
         else:
-            headers["Authorization"] = f"Bearer {await self._get_bearer_token()}"
+            headers["Authorization"] = f"Bearer {self._get_bearer_token()}"
         t_auth = time.monotonic()
 
         definition = json.dumps({"locales": [language]})
@@ -108,5 +112,3 @@ class AzureFastTranscription(STTBase):
     async def close(self) -> None:
         if self._session and not self._session.closed:
             await self._session.close()
-        if not self._use_key:
-            await self._credential.close()

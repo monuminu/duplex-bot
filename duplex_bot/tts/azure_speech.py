@@ -3,13 +3,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import queue as thread_queue
-import time
 from collections.abc import AsyncIterator
 
 import azure.cognitiveservices.speech as speechsdk
 
 from duplex_bot.config import AzureSpeechConfig, AzureTTSConfig
 from duplex_bot.core.audio import pcm_duration_ms
+from duplex_bot.core.azure_token import AzureTokenProvider
 from duplex_bot.core.events import TTSAudioChunk
 from duplex_bot.tts.base import TTSBase, TTSSession
 
@@ -26,14 +26,16 @@ class AzureSpeechTTS(TTSBase):
     via callback as they are generated, not after synthesis completes.
     """
 
-    def __init__(self, speech_config: AzureSpeechConfig, tts_config: AzureTTSConfig):
+    def __init__(
+        self,
+        speech_config: AzureSpeechConfig,
+        tts_config: AzureTTSConfig,
+        token_provider: AzureTokenProvider | None = None,
+    ):
         self._speech_config = speech_config
         self._tts_config = tts_config
         self._sample_rate = self._parse_sample_rate(tts_config.output_format)
-
-        self._credential = None
-        self._cached_token: str = ""
-        self._token_expires_at: float = 0
+        self._token_provider = token_provider
 
     def _parse_sample_rate(self, output_format: str) -> int:
         if "16Khz" in output_format or "16khz" in output_format:
@@ -45,21 +47,9 @@ class AzureSpeechTTS(TTSBase):
         return 16000
 
     def _get_entra_token(self) -> str:
-        now = time.time()
-        if self._cached_token and now < self._token_expires_at - 60:
-            return self._cached_token
-
-        if self._credential is None:
-            from azure.identity import DefaultAzureCredential
-            self._credential = DefaultAzureCredential(
-                exclude_managed_identity_credential=True,
-            )
-
-        token = self._credential.get_token("https://cognitiveservices.azure.com/.default")
-        self._cached_token = token.token
-        self._token_expires_at = token.expires_on
-        logger.debug("Azure Entra TTS token refreshed")
-        return self._cached_token
+        if self._token_provider is None:
+            raise RuntimeError("No token provider configured for Entra auth")
+        return self._token_provider.token
 
     def _get_speech_config(self) -> speechsdk.SpeechConfig:
         region = self._speech_config.region

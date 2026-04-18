@@ -37,6 +37,8 @@ from duplex_bot.vad.stream import VADStream, SpeechEnded, SpeechStarted
 
 logger = logging.getLogger(__name__)
 
+_welcome_audio_cache: dict[str, list[TTSAudioChunk]] = {}
+
 
 class VoiceSession:
     """Per-connection orchestrator that wires the full pipeline.
@@ -116,6 +118,8 @@ class VoiceSession:
 
         if self._config.welcome_message:
             await self._speak_welcome(websocket)
+        else:
+            await self._stt.warmup()
 
         self._tasks = [
             asyncio.create_task(self._inbound_loop(websocket), name="inbound"),
@@ -162,25 +166,46 @@ class VoiceSession:
         logger.info("Session %s shut down", self.session_id)
 
     async def _speak_welcome(self, websocket: WebSocket) -> None:
-        """Synthesize and send the welcome message, pre-warming the TTS connection."""
+        """Synthesize and send the welcome message, pre-warming the TTS connection.
+
+        Warms up the STT HTTP connection concurrently while welcome audio plays.
+        When ``cache_welcome_audio`` is enabled, the synthesized audio is cached
+        at module level so subsequent sessions replay it instantly.
+        """
         text = self._config.welcome_message
         logger.info("Session %s: speaking welcome message", self.session_id)
 
         self._conversation.add_assistant_message(text)
         await self._adapter.send_text(websocket, "agent_text", text)
 
-        tts_start = time.monotonic() * 1000
-        first_byte = True
+        stt_warmup_task = asyncio.create_task(self._stt.warmup())
 
-        async for audio_chunk in self._tts_session.synthesize_stream(text):
-            if first_byte:
-                tts_ttfb = time.monotonic() * 1000 - tts_start
-                first_byte = False
-                logger.info(
-                    "Welcome TTS: first audio chunk (TTFB=%.0fms)", tts_ttfb
-                )
-            await self._adapter.send_audio(websocket, audio_chunk)
+        cache_key = f"{text}:{self._config.azure_tts.voice_name}"
+        cached = _welcome_audio_cache.get(cache_key) if self._config.cache_welcome_audio else None
 
+        if cached is not None:
+            logger.info("Welcome TTS: serving from cache (%d chunks)", len(cached))
+            for chunk in cached:
+                await self._adapter.send_audio(websocket, chunk)
+        else:
+            tts_start = time.monotonic() * 1000
+            first_byte = True
+            chunks: list[TTSAudioChunk] = []
+
+            async for audio_chunk in self._tts_session.synthesize_stream(text):
+                if first_byte:
+                    tts_ttfb = time.monotonic() * 1000 - tts_start
+                    first_byte = False
+                    logger.info(
+                        "Welcome TTS: first audio chunk (TTFB=%.0fms)", tts_ttfb
+                    )
+                chunks.append(audio_chunk)
+                await self._adapter.send_audio(websocket, audio_chunk)
+
+            if self._config.cache_welcome_audio:
+                _welcome_audio_cache[cache_key] = chunks
+
+        await stt_warmup_task
         logger.info("Session %s: welcome message sent", self.session_id)
 
     # ─── Pipeline Loops ─────────────────────────────────────────────

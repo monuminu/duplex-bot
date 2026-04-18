@@ -45,7 +45,7 @@ class VADConfig(BaseModel):
     sample_rate: int = 16000
     min_speech_duration_ms: int = 300
     max_speech_duration_s: int = 20
-    min_silence_duration_ms: int = 600
+    min_silence_duration_ms: int = 400
     window_size_samples: int = 512
     speech_pad_ms: int = 200
     prefix_padding_ms: int = 200
@@ -92,6 +92,9 @@ class AppConfig(BaseSettings):
     tts_provider: str = "azure"
     tts_streaming_mode: str = "incremental"  # "incremental" (token-by-token) or "sentence" (accumulate sentences)
 
+    max_call_duration_s: int = 1800  # 30 minutes
+
     system_prompt: str = "You are a helpful voice assistant. Keep your responses concise and conversational."
     welcome_message: str = ""
+    cache_welcome_audio: bool = True
     internal_sample_rate: int = 16000

@@ -7,9 +7,9 @@ from collections.abc import AsyncIterator
 import httpx
 
 from duplex_bot.config import LLMConfig
+from duplex_bot.core.azure_token import AzureTokenProvider
 from duplex_bot.core.events import LLMResponseChunk, ToolCallFragment
 from duplex_bot.llm.base import LLMBase
-from azure.identity.aio import DefaultAzureCredential, get_bearer_token_provider
 from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
@@ -31,15 +31,17 @@ class OpenAIResponsesLLM(LLMBase):
     Tool calls are accumulated and emitted on the final chunk.
     """
 
-    def __init__(self, config: LLMConfig):
+    def __init__(self, config: LLMConfig, token_provider: AzureTokenProvider | None = None):
         self._config = config
-        token_provider = get_bearer_token_provider(
-            DefaultAzureCredential(exclude_managed_identity_credential=True),
-            "https://cognitiveservices.azure.com/.default",
-        )
+        if token_provider is not None:
+            api_key = token_provider
+        elif config.api_key:
+            api_key = config.api_key
+        else:
+            raise ValueError("LLM requires either a shared AzureTokenProvider or an api_key in config")
         self._client = AsyncOpenAI(
             base_url=config.base_url,
-            api_key=token_provider,
+            api_key=api_key,
         )
 
     @staticmethod
