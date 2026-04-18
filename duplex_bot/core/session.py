@@ -428,7 +428,7 @@ class VoiceSession:
 
         try:
             async for chunk in self._llm.generate_stream(messages, tools):
-                print(chunk.text, end="", flush=True)  # Debug: print tokens as they arrive
+                logger.info(f"LLM chunk: {chunk.text}")  # Debug: print tokens as they arrive
                 if first_token_at is None and chunk.text:
                     first_token_at = time.monotonic() * 1000
 
@@ -437,12 +437,14 @@ class VoiceSession:
 
                     if incremental:
                         await self._tts_text_q.put(chunk.text)
+                        await asyncio.sleep(0)
                     else:
                         sentences, sentence_buffer = accumulate_sentences(
                             sentence_buffer, chunk.text
                         )
                         for sentence in sentences:
                             await self._tts_text_q.put(sentence)
+                            await asyncio.sleep(0)
 
                 if chunk.is_final:
                     if not incremental and sentence_buffer.strip():
@@ -576,7 +578,7 @@ class VoiceSession:
         _chunk_count = 0
 
         try:
-            async for audio_chunk in self._tts.synthesize_stream_incremental(
+            async for audio_chunk in self._tts_session.synthesize_stream_incremental(
                 _token_stream()
             ):
                 if self._tts_cancel.is_set():

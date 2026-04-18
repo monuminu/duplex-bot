@@ -378,6 +378,69 @@ class AzureTTSSession(TTSSession):
 
         await fut
 
+    async def synthesize_stream_incremental(
+        self, text_chunks: AsyncIterator[str], voice: str | None = None,
+    ) -> AsyncIterator[TTSAudioChunk]:
+        """Stream audio from incremental text using the pooled synthesizer."""
+        self._loop = asyncio.get_event_loop()
+        self._audio_q = asyncio.Queue()
+        self._cumulative_ms = 0.0
+        self._current_text = ""
+
+        text_q: thread_queue.Queue[str | None] = thread_queue.Queue()
+
+        def _synth_in_thread() -> None:
+            synthesizer = self._ensure_synthesizer(voice)
+
+            tts_request = speechsdk.SpeechSynthesisRequest(
+                input_type=speechsdk.SpeechSynthesisRequestInputType.TextStream,
+            )
+            tts_task = synthesizer.speak_async(tts_request)
+
+            while True:
+                text = text_q.get()
+                if text is None:
+                    break
+                tts_request.input_stream.write(text)
+
+            tts_request.input_stream.close()
+            result = tts_task.get()
+
+            if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
+                cancellation = getattr(result, "cancellation_details", None)
+                logger.error(
+                    "Azure TTS session incremental failed: reason=%s, error_code=%s, details=%s",
+                    result.reason,
+                    getattr(cancellation, "error_code", "N/A") if cancellation else "N/A",
+                    getattr(cancellation, "error_details", "N/A") if cancellation else "N/A",
+                )
+
+            self._loop.call_soon_threadsafe(self._audio_q.put_nowait, None)
+
+        fut = self._loop.run_in_executor(None, _synth_in_thread)
+
+        async def _feed_text() -> None:
+            try:
+                async for chunk in text_chunks:
+                    if chunk:
+                        self._current_text += chunk
+                        text_q.put(chunk)
+            finally:
+                text_q.put(None)
+
+        feed_task = asyncio.create_task(_feed_text())
+
+        try:
+            while True:
+                chunk = await self._audio_q.get()
+                if chunk is None:
+                    break
+                yield chunk
+        finally:
+            feed_task.cancel()
+            await asyncio.gather(feed_task, return_exceptions=True)
+            await fut
+
     async def close(self) -> None:
         self._synthesizer = None
         logger.info("Azure TTS session: synthesizer released")

@@ -23,6 +23,12 @@ class TTSSession:
         async for chunk in self._tts.synthesize_stream(text, voice):
             yield chunk
 
+    async def synthesize_stream_incremental(
+        self, text_chunks: AsyncIterator[str], voice: str | None = None
+    ) -> AsyncIterator[TTSAudioChunk]:
+        async for chunk in self._tts.synthesize_stream_incremental(text_chunks, voice):
+            yield chunk
+
     async def close(self) -> None:
         pass
 
