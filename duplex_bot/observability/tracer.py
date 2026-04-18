@@ -10,17 +10,19 @@ logger = logging.getLogger(__name__)
 
 
 class SessionTracer:
-    """Langfuse-based observability for voice sessions.
+    """Langfuse v4 observability for voice sessions.
 
-    Each voice session = 1 Langfuse trace.
-    Each pipeline stage = a span within that trace.
-    Each LLM call = a generation within the trace.
+    Each voice session = 1 Langfuse trace (root span).
+    Each pipeline stage = a child span.
+    Each LLM call = a generation observation.
     """
 
     def __init__(self, config: LangfuseConfig):
         self._config = config
         self._langfuse = None
-        self._trace = None
+        self._root_span = None
+        self._root_cm = None
+        self._propagate_cm = None
         self._spans: dict[str, Any] = {}
         self._span_start_times: dict[str, float] = {}
         self._session_start_ms: float = 0
@@ -50,14 +52,22 @@ class SessionTracer:
             return
 
         try:
-            self._trace = self._langfuse.trace(
-                name="voice_session",
+            from langfuse import propagate_attributes
+
+            self._propagate_cm = propagate_attributes(
                 session_id=session_id,
-                metadata={
-                    "adapter": adapter_name,
-                    **(metadata or {}),
-                },
+                trace_name="voice_session",
+                metadata={"adapter": adapter_name},
             )
+            self._propagate_cm.__enter__()
+
+            self._root_cm = self._langfuse.start_as_current_observation(
+                as_type="span",
+                name="voice_session",
+                input={"adapter": adapter_name, "session_id": session_id},
+                metadata={"adapter": adapter_name, **(metadata or {})},
+            )
+            self._root_span = self._root_cm.__enter__()
         except Exception:
             logger.exception("Failed to create Langfuse trace")
 
@@ -68,36 +78,44 @@ class SessionTracer:
         **extra: Any,
     ) -> None:
         """Finalize the session trace with summary metrics."""
-        if not self._trace:
-            return
-
         session_duration = time.monotonic() * 1000 - self._session_start_ms
 
-        try:
-            self._trace.update(
-                metadata={
-                    "session_duration_ms": session_duration,
-                    "turn_count": turn_count,
-                    "barge_in_count": barge_in_count,
-                    **extra,
-                },
-            )
-        except Exception:
-            logger.exception("Failed to update Langfuse trace")
+        if self._root_span:
+            try:
+                self._root_span.update(
+                    output={
+                        "session_duration_ms": session_duration,
+                        "turn_count": turn_count,
+                        "barge_in_count": barge_in_count,
+                        **extra,
+                    },
+                )
+            except Exception:
+                logger.exception("Failed to update Langfuse trace")
+
+        if self._root_cm:
+            try:
+                self._root_cm.__exit__(None, None, None)
+            except Exception:
+                logger.exception("Failed to close root span context")
+
+        if self._propagate_cm:
+            try:
+                self._propagate_cm.__exit__(None, None, None)
+            except Exception:
+                logger.exception("Failed to close propagate_attributes context")
 
     def start_span(self, name: str, metadata: dict | None = None) -> str:
-        """Start a named span within the session trace.
-
-        Returns a span_id string for tracking.
-        """
+        """Start a named span within the session trace."""
         span_id = f"{name}_{time.monotonic_ns()}"
         self._span_start_times[span_id] = time.monotonic() * 1000
 
-        if not self._trace:
+        if not self._root_span:
             return span_id
 
         try:
-            span = self._trace.span(
+            span = self._root_span.start_observation(
+                as_type="span",
                 name=name,
                 metadata=metadata or {},
             )
@@ -108,11 +126,7 @@ class SessionTracer:
         return span_id
 
     def end_span(self, name: str, metadata: dict | None = None) -> None:
-        """End the most recent span with the given name.
-
-        Also records the span duration.
-        """
-        # Find the most recent span with this name
+        """End the most recent span with the given name."""
         matching = [
             sid for sid in self._spans if sid.startswith(f"{name}_")
         ]
@@ -126,12 +140,13 @@ class SessionTracer:
         span = self._spans.pop(span_id, None)
         if span:
             try:
-                span.end(
+                span.update(
                     metadata={
                         "duration_ms": duration_ms,
                         **(metadata or {}),
                     },
                 )
+                span.end()
             except Exception:
                 logger.exception("Failed to end Langfuse span: %s", name)
 
@@ -143,27 +158,29 @@ class SessionTracer:
         usage: dict | None = None,
     ) -> None:
         """Record an LLM generation event."""
-        if not self._trace:
+        if not self._root_span:
             return
 
         try:
-            self._trace.generation(
+            gen = self._root_span.start_observation(
+                as_type="generation",
                 name="llm_generation",
                 model=model,
                 input=input_messages,
                 output=output,
-                usage=usage,
+                usage_details=usage,
             )
+            gen.end()
         except Exception:
             logger.exception("Failed to record Langfuse generation")
 
     def record_event(self, name: str, metadata: dict | None = None) -> None:
         """Record a discrete event (barge-in, turn completion, etc.)."""
-        if not self._trace:
+        if not self._root_span:
             return
 
         try:
-            self._trace.event(
+            self._root_span.create_event(
                 name=name,
                 metadata=metadata or {},
             )
