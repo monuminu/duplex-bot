@@ -24,7 +24,7 @@ from duplex_bot.core.events import (
     TTSAudioChunk,
     ToolCallFragment,
 )
-from duplex_bot.core.pipeline import accumulate_sentences
+from duplex_bot.core.pipeline import accumulate_sentences, split_sentences
 from duplex_bot.llm.base import LLMBase
 from duplex_bot.llm.function_calling import FunctionExecutor, FunctionRegistry
 from duplex_bot.llm.turn_detector import TurnDetector
@@ -92,6 +92,19 @@ class VoiceSession:
         self._current_llm_task: asyncio.Task | None = None
         self._tts_cancel = asyncio.Event()  # Set to cancel in-flight TTS synthesis
         self._shutdown_event = asyncio.Event()
+
+        # False positive barge-in resume state
+        self._interrupted_full_response: str | None = None
+        self._interrupted_heard_text: str | None = None
+        self._interrupted_remaining_text: str | None = None
+        self._awaiting_stt_after_interrupt: bool = False
+        self._resume_task: asyncio.Task | None = None
+        self._stt_confirmation_timer: asyncio.Task | None = None
+        self._stt_confirmation_event: asyncio.Event = asyncio.Event()
+        self._last_stt_was_meaningful: bool = False
+        self._resume_prefix_text: str | None = None
+        self._current_llm_full_response: str = ""
+        self._tts_finished_at_ms: float = 0
 
         # Persistent TTS session — created once, reused for welcome + all responses
         self._tts_session = self._tts.create_session()
@@ -333,6 +346,15 @@ class VoiceSession:
                         "text": transcript.text,
                     })
 
+                # Signal the false-positive-resume confirmation gate
+                if self._awaiting_stt_after_interrupt:
+                    is_meaningful = (
+                        bool(transcript.text.strip())
+                        and self._noise_filter.is_meaningful(transcript.text)
+                    )
+                    self._last_stt_was_meaningful = is_meaningful
+                    self._stt_confirmation_event.set()
+
                 if transcript.text.strip():
                     # Apply noise filter
                     if self._noise_filter.is_meaningful(transcript.text):
@@ -399,6 +421,12 @@ class VoiceSession:
 
     async def _generate_response(self) -> None:
         """Generate LLM response and stream to TTS."""
+        # Cancel any pending false-positive resume — a real turn supersedes it
+        if self._resume_task and not self._resume_task.done():
+            self._resume_task.cancel()
+            self._resume_task = None
+            self._clear_resume_state()
+
         # Cancel any previous in-progress generation
         if self._current_llm_task and not self._current_llm_task.done():
             self._current_llm_task.cancel()
@@ -419,6 +447,7 @@ class VoiceSession:
         if self._tracer:
             span_id = self._tracer.start_span("llm")
 
+        self._current_llm_full_response = ""
         llm_start = time.monotonic() * 1000
         first_token_at: float | None = None
         full_response = ""
@@ -428,12 +457,13 @@ class VoiceSession:
 
         try:
             async for chunk in self._llm.generate_stream(messages, tools):
-                logger.info(f"LLM chunk: {chunk.text}")  # Debug: print tokens as they arrive
+                #logger.info(f"LLM chunk: {chunk.text}")  # Debug: print tokens as they arrive
                 if first_token_at is None and chunk.text:
                     first_token_at = time.monotonic() * 1000
 
                 if chunk.text:
                     full_response += chunk.text
+                    self._current_llm_full_response = full_response
 
                     if incremental:
                         await self._tts_text_q.put(chunk.text)
@@ -549,6 +579,7 @@ class VoiceSession:
 
         self._is_agent_speaking = True
         self._tts_cancel.clear()
+        self._truncation.reset()
         accumulated_text = first_token
 
         async def _token_stream():
@@ -581,9 +612,9 @@ class VoiceSession:
             async for audio_chunk in self._tts_session.synthesize_stream_incremental(
                 _token_stream()
             ):
-                if self._tts_cancel.is_set():
-                    logger.info("TTS: cancelled mid-stream after %d chunks", _chunk_count)
-                    break
+                # if self._tts_cancel.is_set():
+                #     logger.info("TTS: cancelled mid-stream after %d chunks", _chunk_count)
+                #     break
 
                 _chunk_count += 1
                 if first_byte:
@@ -622,7 +653,7 @@ class VoiceSession:
             })
 
         self._is_agent_speaking = False
-        self._truncation.reset()
+        self._tts_finished_at_ms = time.monotonic() * 1000
 
     # ── sentence mode ───────────────────────────────────────────────
 
@@ -637,6 +668,7 @@ class VoiceSession:
 
         self._is_agent_speaking = True
         self._tts_cancel.clear()
+        self._truncation.reset()
 
         while text:
             if self._tts_cancel.is_set():
@@ -699,7 +731,7 @@ class VoiceSession:
             text = await self._tts_text_q.get()
 
         self._is_agent_speaking = False
-        self._truncation.reset()
+        self._tts_finished_at_ms = time.monotonic() * 1000
 
     async def _interrupt_handler(self, websocket: WebSocket) -> None:
         """Handle barge-in interrupts."""
@@ -716,6 +748,16 @@ class VoiceSession:
                     self._tracer.record_event("barge_in", {
                         "playback_position_ms": interrupt.playback_position_ms,
                     })
+
+                # Cancel any pending false-positive resume from a previous interrupt
+                if self._resume_task and not self._resume_task.done():
+                    self._resume_task.cancel()
+                    self._resume_task = None
+                if self._stt_confirmation_timer and not self._stt_confirmation_timer.done():
+                    self._stt_confirmation_timer.cancel()
+                    self._stt_confirmation_timer = None
+                self._awaiting_stt_after_interrupt = False
+                self._stt_confirmation_event.clear()
 
                 # 1. Cancel in-flight TTS synthesis immediately
                 self._tts_cancel.set()
@@ -738,6 +780,34 @@ class VoiceSession:
                 heard_text = self._truncation.get_heard_text(
                     interrupt.playback_position_ms
                 )
+                if self._resume_prefix_text:
+                    heard_text = (self._resume_prefix_text + " " + heard_text).strip()
+                    self._resume_prefix_text = None
+
+                # Save state for potential false-positive resume before truncating.
+                # Check both actively speaking AND recently finished (client may
+                # still be playing buffered audio after server-side TTS completes).
+                recently_finished = (
+                    self._tts_finished_at_ms > 0
+                    and (time.monotonic() * 1000 - self._tts_finished_at_ms) < 10_000
+                )
+                may_be_speaking = self._is_agent_speaking or recently_finished
+                if (self._config.barge_in.false_positive_resume_enabled
+                        and may_be_speaking):
+                    full_response = (
+                        self._current_llm_full_response
+                        or self._conversation.get_last_assistant_content()
+                    )
+                    remaining = self._compute_remaining_text(
+                        full_response, heard_text,
+                        interrupt.playback_position_ms,
+                    )
+                    if full_response and remaining:
+                        self._interrupted_full_response = full_response
+                        self._interrupted_heard_text = heard_text or ""
+                        self._interrupted_remaining_text = remaining
+                        self._awaiting_stt_after_interrupt = True
+
                 if heard_text:
                     self._conversation.truncate_last_assistant(heard_text)
                     if self._tracer:
@@ -749,10 +819,128 @@ class VoiceSession:
                 self._is_agent_speaking = False
                 self._truncation.reset()
 
+                # 7. Spawn false-positive confirmation watcher
+                if self._awaiting_stt_after_interrupt:
+                    self._stt_confirmation_event.clear()
+                    self._stt_confirmation_timer = asyncio.create_task(
+                        self._stt_confirmation_timeout()
+                    )
+                    self._resume_task = asyncio.create_task(
+                        self._handle_interrupt_confirmation()
+                    )
+
                 # NOTE: We do NOT cancel in-flight function calls
 
         except asyncio.CancelledError:
             pass
+
+    async def _stt_confirmation_timeout(self) -> None:
+        """Fire when no STT result arrives (VAD false alarm — no segment)."""
+        try:
+            await asyncio.sleep(self._config.barge_in.stt_confirmation_timeout_s)
+            if self._awaiting_stt_after_interrupt:
+                self._last_stt_was_meaningful = False
+                self._stt_confirmation_event.set()
+        except asyncio.CancelledError:
+            pass
+
+    async def _handle_interrupt_confirmation(self) -> None:
+        """Wait for STT to confirm or deny the barge-in, then resume if false positive."""
+        try:
+            await self._stt_confirmation_event.wait()
+            self._awaiting_stt_after_interrupt = False
+
+            if self._stt_confirmation_timer and not self._stt_confirmation_timer.done():
+                self._stt_confirmation_timer.cancel()
+                self._stt_confirmation_timer = None
+
+            if self._last_stt_was_meaningful:
+                logger.info("Barge-in confirmed as real (meaningful STT)")
+                self._clear_resume_state()
+                return
+
+            logger.info(
+                "False positive barge-in detected, resuming in %.1fs",
+                self._config.barge_in.false_positive_resume_timeout_s,
+            )
+            if self._tracer:
+                self._tracer.record_event("false_positive_barge_in", {
+                    "heard_text": self._interrupted_heard_text,
+                    "resume_after_s": self._config.barge_in.false_positive_resume_timeout_s,
+                })
+
+            await asyncio.sleep(self._config.barge_in.false_positive_resume_timeout_s)
+            await self._resume_interrupted_response()
+
+        except asyncio.CancelledError:
+            logger.debug("Resume watcher cancelled (new interrupt or shutdown)")
+
+    async def _resume_interrupted_response(self) -> None:
+        """Resume speaking the un-heard portion of the interrupted response."""
+        if not self._interrupted_remaining_text:
+            self._clear_resume_state()
+            return
+
+        remaining = self._interrupted_remaining_text
+        full = self._interrupted_full_response
+
+        logger.info("Resuming interrupted response: '%s...'", remaining[:60])
+        if self._tracer:
+            self._tracer.record_event("false_positive_resume", {
+                "remaining_text": remaining[:200],
+            })
+
+        if full:
+            self._conversation.restore_last_assistant(full)
+
+        self._resume_prefix_text = self._interrupted_heard_text
+        self._clear_resume_state()
+
+        for sentence in split_sentences(remaining) or [remaining]:
+            await self._tts_text_q.put(sentence)
+        await self._tts_text_q.put("")
+
+    def _compute_remaining_text(
+        self,
+        full_response: str | None,
+        heard_text: str,
+        playback_position_ms: float,
+    ) -> str:
+        """Determine the un-heard portion of the response after a barge-in."""
+        if not full_response:
+            return ""
+
+        if not heard_text:
+            return full_response
+
+        # Sentence mode: heard_text is a true prefix of the full response
+        if heard_text != full_response:
+            idx = full_response.find(heard_text)
+            if idx >= 0:
+                return full_response[idx + len(heard_text):].strip()
+            return ""
+
+        # Incremental mode: heard_text == full_response because every TTS
+        # chunk records the running accumulated text.  Fall back to a
+        # duration-based estimate of how far the user actually listened.
+        total_ms = self._truncation._total_duration_ms
+        if total_ms <= 0 or playback_position_ms <= 0:
+            return full_response
+        if playback_position_ms >= total_ms:
+            return ""
+
+        fraction = playback_position_ms / total_ms
+        char_pos = int(len(full_response) * fraction)
+        # Snap forward to the nearest word boundary
+        while char_pos < len(full_response) and full_response[char_pos] != " ":
+            char_pos += 1
+        return full_response[char_pos:].strip()
+
+    def _clear_resume_state(self) -> None:
+        self._interrupted_full_response = None
+        self._interrupted_heard_text = None
+        self._interrupted_remaining_text = None
+        self._tts_finished_at_ms = 0
 
     async def _function_result_loop(self) -> None:
         """Process function call results and trigger follow-up LLM generation."""

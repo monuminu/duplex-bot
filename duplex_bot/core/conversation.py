@@ -47,6 +47,25 @@ class ConversationHistory:
                 return
         logger.warning("No assistant message found to truncate")
 
+    def get_last_assistant_content(self) -> str | None:
+        """Return the content of the last assistant message, or None."""
+        for msg in reversed(self._messages):
+            if msg["role"] == "assistant" and isinstance(msg.get("content"), str):
+                return msg["content"]
+        return None
+
+    def restore_last_assistant(self, full_text: str) -> None:
+        """Restore the last assistant message to its full text.
+
+        Inverse of truncate_last_assistant — used when a barge-in turns
+        out to be a false positive and we need to undo the truncation.
+        """
+        for i in range(len(self._messages) - 1, -1, -1):
+            if self._messages[i]["role"] == "assistant":
+                self._messages[i]["content"] = full_text
+                logger.debug("Restored assistant message to full text: '%s...'", full_text[:50])
+                return
+
     def add_tool_call(self, call_id: str, name: str, arguments: str) -> None:
         """Record that the assistant made a tool call."""
         # Append to the last assistant message or create a new one

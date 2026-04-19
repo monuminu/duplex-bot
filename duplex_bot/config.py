@@ -63,6 +63,12 @@ class TTSProviderType(str):
     ELEVENLABS = "elevenlabs"
 
 
+class BargeInConfig(BaseModel):
+    false_positive_resume_enabled: bool = True
+    false_positive_resume_timeout_s: float = 5.0
+    stt_confirmation_timeout_s: float = 8.0
+
+
 class LangfuseConfig(BaseModel):
     public_key: str = ""
     secret_key: str = ""
@@ -88,6 +94,7 @@ class AppConfig(BaseSettings):
     vad: VADConfig = VADConfig()
     eot: EndOfTurnConfig = EndOfTurnConfig()
     langfuse: LangfuseConfig = LangfuseConfig()
+    barge_in: BargeInConfig = BargeInConfig()
 
     tts_provider: str = "azure"
     tts_streaming_mode: str = "incremental"  # "incremental" (token-by-token) or "sentence" (accumulate sentences)
