@@ -134,8 +134,10 @@
     let mediaStream = null;
     let scriptProcessor = null;
     let playbackQueue = [];
-    let isPlaying = false;
     let currentSource = null;
+    let nextPlayTime = 0;
+    let isBuffering = true;
+    const JITTER_BUFFER_SIZE = 3;
 
     async function enumerateMics() {
         // Request permission first so device labels are available
@@ -279,46 +281,65 @@
     function handleAudioResponse(arrayBuffer) {
         setIndicator('speaking');
         playbackQueue.push(arrayBuffer);
-        if (!isPlaying) {
-            playNextChunk();
-        }
-    }
-
-    function playNextChunk() {
-        if (playbackQueue.length === 0) {
-            isPlaying = false;
-            currentSource = null;
-            setIndicator('listening');
+        if (isBuffering) {
+            if (playbackQueue.length >= JITTER_BUFFER_SIZE) {
+                isBuffering = false;
+                drainQueue();
+            }
             return;
         }
+        drainQueue();
+    }
 
-        isPlaying = true;
-        const data = playbackQueue.shift();
-        const int16 = new Int16Array(data);
+    function decodeChunk(arrayBuffer) {
+        const int16 = new Int16Array(arrayBuffer);
         const float32 = new Float32Array(int16.length);
         for (let i = 0; i < int16.length; i++) {
             float32[i] = int16[i] / 0x8000;
         }
-
         const buffer = audioContext.createBuffer(1, float32.length, SAMPLE_RATE);
         buffer.getChannelData(0).set(float32);
+        return buffer;
+    }
 
-        const source = audioContext.createBufferSource();
-        source.buffer = buffer;
-        source.connect(audioContext.destination);
-        source.onended = playNextChunk;
-        source.start();
-        currentSource = source;
+    function drainQueue() {
+        if (playbackQueue.length === 0) return;
+
+        const now = audioContext.currentTime;
+        if (nextPlayTime <= now) {
+            nextPlayTime = now + 0.05;
+        }
+
+        while (playbackQueue.length > 0) {
+            const data = playbackQueue.shift();
+            const buffer = decodeChunk(data);
+
+            const source = audioContext.createBufferSource();
+            source.buffer = buffer;
+            source.connect(audioContext.destination);
+            source.start(nextPlayTime);
+            nextPlayTime += buffer.duration;
+            currentSource = source;
+        }
+
+        currentSource.onended = () => {
+            if (playbackQueue.length > 0) {
+                drainQueue();
+            } else {
+                currentSource = null;
+                setIndicator('listening');
+            }
+        };
     }
 
     function handleControlMessage(msg) {
         switch (msg.type) {
             case 'clear':
-                // Barge-in: stop playback immediately
                 playbackQueue = [];
-                isPlaying = false;
+                nextPlayTime = 0;
+                isBuffering = true;
                 if (currentSource) {
-                    currentSource.onended = null;  // Prevent chaining
+                    currentSource.onended = null;
                     try { currentSource.stop(); } catch (e) {}
                     currentSource = null;
                 }
@@ -360,7 +381,8 @@
         }
         ws = null;
         playbackQueue = [];
-        isPlaying = false;
+        nextPlayTime = 0;
+        isBuffering = true;
         if (currentSource) {
             currentSource.onended = null;
             try { currentSource.stop(); } catch (e) {}
