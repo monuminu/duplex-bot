@@ -194,4 +194,4 @@ uv run python -m duplex_bot.main
 
 ## License
 
-Private.
+MIT License.
