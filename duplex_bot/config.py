@@ -45,7 +45,9 @@ class VADConfig(BaseModel):
     sample_rate: int = 16000
     min_speech_duration_ms: int = 300
     max_speech_duration_s: int = 20
-    min_silence_duration_ms: int = 400
+    # Lower values reduce turn latency but can cut off users who pause mid-thought.
+    min_silence_duration_ms: int = 250
+    trailing_silence_ms: int = 100
     window_size_samples: int = 512
     speech_pad_ms: int = 200
     prefix_padding_ms: int = 200
@@ -101,6 +103,7 @@ class AppConfig(BaseSettings):
 
     tts_provider: str = "azure"
     tts_streaming_mode: str = "incremental"  # "incremental" (token-by-token) or "sentence" (accumulate sentences)
+    tts_output_chunk_ms: int = 32
 
     max_call_duration_s: int = 1800  # 30 minutes
 

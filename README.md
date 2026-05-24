@@ -93,6 +93,13 @@ All configuration is via environment variables or `.env` file, using nested deli
 | `PORT` | `8000` | Server port |
 | `SYSTEM_PROMPT` | (conversational assistant) | LLM system prompt |
 | `TTS_PROVIDER` | `azure` | TTS backend: `azure` or `elevenlabs` |
+| `TTS_OUTPUT_CHUNK_MS` | `32` | Outbound TTS frame size for lower playback start latency |
+| **VAD / Turn Detection** | | |
+| `VAD__MIN_SILENCE_DURATION_MS` | `250` | Silence required before committing a speech segment |
+| `VAD__TRAILING_SILENCE_MS` | `100` | Maximum trailing silence kept in STT audio |
+| `EOT__ENABLED` | `false` | Enable semantic end-of-turn checks instead of immediate post-STT turns |
+| `EOT__SILENCE_THRESHOLD_MS` | `700` | Hard silence threshold when semantic EOT is enabled |
+| `EOT__SEMANTIC_CHECK_AFTER_MS` | `300` | Delay before semantic EOT checks when enabled |
 | **Azure Speech** | | |
 | `AZURE_SPEECH__SUBSCRIPTION_KEY` | | Azure Speech Services key |
 | `AZURE_SPEECH__REGION` | `eastus` | Azure region |

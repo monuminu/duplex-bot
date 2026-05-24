@@ -91,6 +91,21 @@ def split_pcm_chunks(pcm_data: bytes, chunk_duration_ms: int, sample_rate: int, 
     return chunks
 
 
+def keep_trailing_pcm(
+    pcm_data: bytes,
+    keep_duration_ms: int,
+    sample_rate: int,
+    sample_width: int = 2,
+) -> bytes:
+    """Keep at most the requested amount of trailing PCM audio."""
+    if keep_duration_ms <= 0:
+        return b""
+    bytes_to_keep = int(sample_rate * sample_width * keep_duration_ms / 1000)
+    if len(pcm_data) <= bytes_to_keep:
+        return pcm_data
+    return pcm_data[-bytes_to_keep:]
+
+
 def pcm_to_float32(pcm_data: bytes, sample_width: int = 2) -> list[float]:
     """Convert 16-bit PCM bytes to float32 samples in [-1.0, 1.0] range.
 

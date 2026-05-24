@@ -137,7 +137,8 @@
     let scheduledSources = [];
     let nextPlayTime = 0;
     let isBuffering = true;
-    const JITTER_BUFFER_SIZE = 3;
+    let firstAudioReceivedAt = 0;
+    const JITTER_BUFFER_SIZE = 1;
 
     async function enumerateMics() {
         // Request permission first so device labels are available
@@ -280,6 +281,9 @@
 
     function handleAudioResponse(arrayBuffer) {
         setIndicator('speaking');
+        if (playbackQueue.length === 0 && scheduledSources.length === 0) {
+            firstAudioReceivedAt = performance.now();
+        }
         playbackQueue.push(arrayBuffer);
         if (isBuffering) {
             if (playbackQueue.length >= JITTER_BUFFER_SIZE) {
@@ -307,7 +311,15 @@
 
         const now = audioContext.currentTime;
         if (nextPlayTime <= now) {
-            nextPlayTime = now + 0.05;
+            nextPlayTime = now + 0.01;
+            if (firstAudioReceivedAt > 0) {
+                const browserDelayMs = performance.now() - firstAudioReceivedAt + 10;
+                console.debug(
+                    'first_audio_received_to_playback_start_ms=',
+                    Math.round(browserDelayMs),
+                );
+                firstAudioReceivedAt = 0;
+            }
         }
 
         while (playbackQueue.length > 0) {
@@ -337,6 +349,7 @@
                 playbackQueue = [];
                 nextPlayTime = 0;
                 isBuffering = true;
+                firstAudioReceivedAt = 0;
                 for (const src of scheduledSources) {
                     src.onended = null;
                     try { src.stop(); } catch (e) {}
@@ -382,6 +395,7 @@
         playbackQueue = [];
         nextPlayTime = 0;
         isBuffering = true;
+        firstAudioReceivedAt = 0;
         for (const src of scheduledSources) {
             src.onended = null;
             try { src.stop(); } catch (e) {}

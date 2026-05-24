@@ -6,7 +6,7 @@ from collections import deque
 from enum import Enum, auto
 
 from duplex_bot.config import VADConfig
-from duplex_bot.core.audio import pcm_duration_ms
+from duplex_bot.core.audio import keep_trailing_pcm, pcm_duration_ms
 from duplex_bot.core.events import AudioChunk, InterruptSignal, SpeechSegment
 from duplex_bot.vad.base import VADBase
 
@@ -56,6 +56,7 @@ class VADStream:
         # Buffers
         self._prefix_buffer: deque[bytes] = deque()  # Ring buffer for prefix padding
         self._speech_buffer: list[bytes] = []
+        self._silence_buffer: list[bytes] = []
 
         # Timing
         self._speech_start_ms: float = 0
@@ -117,11 +118,13 @@ class VADStream:
                 logger.debug("VAD: SPEECH_STARTED → IDLE (false alarm, prob=%.3f)", prob)
 
         elif self._state == VADState.SPEECH_ACTIVE:
-            self._speech_buffer.append(chunk.data)
             if is_speech:
+                self._speech_buffer.append(chunk.data)
                 self._speech_duration_ms += chunk_ms
                 self._silence_duration_ms = 0
+                self._silence_buffer.clear()
             else:
+                self._silence_buffer.append(chunk.data)
                 self._silence_duration_ms += chunk_ms
                 if self._silence_duration_ms >= self._config.min_silence_duration_ms:
                     self._state = VADState.SPEECH_ENDING
@@ -140,7 +143,12 @@ class VADStream:
 
     def _emit_speech_segment(self) -> SpeechEnded:
         """Assemble the complete speech segment and reset state."""
-        audio = b"".join(self._speech_buffer)
+        trailing_silence = keep_trailing_pcm(
+            b"".join(self._silence_buffer),
+            self._config.trailing_silence_ms,
+            self._config.sample_rate,
+        )
+        audio = b"".join(self._speech_buffer) + trailing_silence
         duration = pcm_duration_ms(audio, self._config.sample_rate)
         segment = SpeechSegment(
             audio=audio,
@@ -156,6 +164,7 @@ class VADStream:
         """Reset all state back to IDLE."""
         self._state = VADState.IDLE
         self._speech_buffer.clear()
+        self._silence_buffer.clear()
         self._speech_duration_ms = 0
         self._silence_duration_ms = 0
         self._prefix_buffer.clear()

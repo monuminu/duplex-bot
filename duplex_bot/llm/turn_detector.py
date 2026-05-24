@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from typing import Protocol, runtime_checkable
@@ -80,7 +79,7 @@ class TurnDetector:
                     "Semantic EOT: confidence=%.3f, done=%s, text='%s'",
                     confidence,
                     is_done,
-                    self._accumulated_text[:50],
+                    self._accumulated_text,
                 )
                 return is_done
             except Exception:

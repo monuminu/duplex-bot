@@ -35,7 +35,6 @@ class AzureFastTranscription(STTBase):
 
     def _build_base_url(self) -> str:
         resource = self._speech_config.resource_name
-        region = self._speech_config.region
         return f"https://{resource}.cognitiveservices.azure.com/speechtotext/transcriptions:transcribe?api-version=2025-10-15"
 
     def _get_bearer_token(self) -> str:

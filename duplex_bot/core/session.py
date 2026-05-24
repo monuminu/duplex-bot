@@ -4,14 +4,13 @@ import asyncio
 import json
 import logging
 import time
-from uuid import uuid4
 
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
 
 from duplex_bot.adapters.base import TelephonyAdapter
 from duplex_bot.config import AppConfig
-from duplex_bot.core.audio import resample_pcm, split_pcm_chunks
+from duplex_bot.core.audio import pcm_duration_ms, resample_pcm
 from duplex_bot.core.conversation import ConversationHistory
 from duplex_bot.core.events import (
     AudioChunk,
@@ -19,7 +18,6 @@ from duplex_bot.core.events import (
     FunctionCallRequest,
     FunctionCallResult,
     InterruptSignal,
-    LLMResponseChunk,
     SpeechSegment,
     TTSAudioChunk,
     ToolCallFragment,
@@ -131,9 +129,7 @@ class VoiceSession:
 
         logger.info("Session %s started (adapter=%s)", self.session_id, self._adapter.name)
 
-        if self._config.welcome_message:
-            await self._speak_welcome(websocket)
-        else:
+        if not self._config.welcome_message:
             await self._stt.warmup()
 
         self._tasks = [
@@ -145,6 +141,9 @@ class VoiceSession:
             asyncio.create_task(self._interrupt_handler(websocket), name="interrupt"),
             asyncio.create_task(self._function_result_loop(), name="func_result"),
         ]
+
+        if self._config.welcome_message:
+            await self._speak_welcome(websocket)
 
         try:
             # Wait for any task to complete (usually means disconnection or error)
@@ -194,6 +193,9 @@ class VoiceSession:
         await self._adapter.send_text(websocket, "agent_text", text)
 
         stt_warmup_task = asyncio.create_task(self._stt.warmup())
+        self._is_agent_speaking = True
+        self._tts_cancel.clear()
+        self._truncation.reset()
 
         cache_key = f"{text}:{self._config.azure_tts.voice_name}"
         cached = _welcome_audio_cache.get(cache_key) if self._config.cache_welcome_audio else None
@@ -201,13 +203,18 @@ class VoiceSession:
         if cached is not None:
             logger.info("Welcome TTS: serving from cache (%d chunks)", len(cached))
             for chunk in cached:
-                await self._adapter.send_audio(websocket, chunk)
+                if self._tts_cancel.is_set():
+                    break
+                self._truncation.record_segment(text, chunk.cumulative_duration_ms)
+                await self._send_tts_audio(websocket, chunk)
         else:
             tts_start = time.monotonic() * 1000
             first_byte = True
             chunks: list[TTSAudioChunk] = []
 
             async for audio_chunk in self._tts_session.synthesize_stream(text):
+                if self._tts_cancel.is_set():
+                    break
                 if first_byte:
                     tts_ttfb = time.monotonic() * 1000 - tts_start
                     first_byte = False
@@ -215,11 +222,14 @@ class VoiceSession:
                         "Welcome TTS: first audio chunk (TTFB=%.0fms)", tts_ttfb
                     )
                 chunks.append(audio_chunk)
-                await self._adapter.send_audio(websocket, audio_chunk)
+                self._truncation.record_segment(text, audio_chunk.cumulative_duration_ms)
+                await self._send_tts_audio(websocket, audio_chunk)
 
-            if self._config.cache_welcome_audio:
+            if self._config.cache_welcome_audio and not self._tts_cancel.is_set():
                 _welcome_audio_cache[cache_key] = chunks
 
+        self._is_agent_speaking = False
+        self._tts_finished_at_ms = time.monotonic() * 1000
         await stt_warmup_task
         logger.info("Session %s: welcome message sent", self.session_id)
 
@@ -307,7 +317,7 @@ class VoiceSession:
 
                     elif isinstance(vad_event, SpeechEnded):
                         vad_event.segment.session_id = self.session_id
-                        self._input_committed_at_ms = time.monotonic() * 1000
+                        self._input_committed_at_ms = vad_event.segment.committed_at_ms
                         await self._speech_q.put(vad_event.segment)
 
                     if span and self._tracer:
@@ -329,11 +339,11 @@ class VoiceSession:
             while not self._shutdown_event.is_set():
                 segment = await self._speech_q.get()
 
-                span_id = None
                 if self._tracer:
-                    span_id = self._tracer.start_span("stt")
+                    self._tracer.start_span("stt")
 
                 stt_start = time.monotonic() * 1000
+                speech_end_to_stt_start = stt_start - segment.committed_at_ms
                 transcript = await self._stt.transcribe(
                     segment.audio,
                     segment.sample_rate,
@@ -344,6 +354,7 @@ class VoiceSession:
                 if self._tracer:
                     self._tracer.end_span("stt", {
                         "stt_latency_ms": stt_latency,
+                        "speech_end_to_stt_start_ms": speech_end_to_stt_start,
                         "stt_confidence": transcript.confidence,
                         "text": transcript.text,
                     })
@@ -360,7 +371,12 @@ class VoiceSession:
                 if transcript.text.strip():
                     # Apply noise filter
                     if self._noise_filter.is_meaningful(transcript.text):
-                        logger.info("STT: '%s' (%.0fms)", transcript.text, stt_latency)
+                        logger.info(
+                            "STT: '%s' (stt=%.0fms, queued=%.0fms)",
+                            transcript.text,
+                            stt_latency,
+                            speech_end_to_stt_start,
+                        )
                         await self._transcript_q.put(transcript.text)
 
                         # Send transcript to client UI
@@ -396,11 +412,15 @@ class VoiceSession:
                     self._turn_detector._last_transcript_time or time.monotonic() * 1000
                 )
 
-                # is_done = await self._turn_detector.check_end_of_turn(
-                #     silence_ms,
-                #     self._conversation.get_context(),
-                # )
-                is_done = True
+                eot_start = time.monotonic() * 1000
+                if self._config.eot.enabled:
+                    is_done = await self._turn_detector.check_end_of_turn(
+                        silence_ms,
+                        self._conversation.get_context(),
+                    )
+                else:
+                    is_done = True
+                eot_latency = time.monotonic() * 1000 - eot_start
 
                 if is_done:
                     user_text = self._turn_detector.get_accumulated_text()
@@ -413,6 +433,8 @@ class VoiceSession:
                         self._tracer.record_event("user_turn", {
                             "text": user_text,
                             "turn_count": self._conversation.turn_count,
+                            "eot_detection_latency_ms": eot_latency,
+                            "eot_enabled": self._config.eot.enabled,
                         })
 
                     # Trigger LLM generation
@@ -435,11 +457,42 @@ class VoiceSession:
 
         self._current_llm_task = asyncio.create_task(self._llm_generate())
 
-    
     async def clean_text(self, text: str) -> str:
         """Clean LLM output text before sending to TTS."""
         return text
-    
+
+    def _split_tts_audio_chunk(self, chunk: TTSAudioChunk) -> list[TTSAudioChunk]:
+        """Split provider audio into low-latency outbound frames."""
+        target_bytes = int(
+            chunk.sample_rate * 2 * self._config.tts_output_chunk_ms / 1000
+        )
+        if target_bytes <= 0 or len(chunk.audio) <= target_bytes:
+            return [chunk]
+
+        chunk_duration_ms = pcm_duration_ms(chunk.audio, chunk.sample_rate)
+        cumulative_ms = chunk.cumulative_duration_ms - chunk_duration_ms
+        split_chunks: list[TTSAudioChunk] = []
+        for i in range(0, len(chunk.audio), target_bytes):
+            audio = chunk.audio[i : i + target_bytes]
+            if not audio:
+                continue
+            cumulative_ms += pcm_duration_ms(audio, chunk.sample_rate)
+            split_chunks.append(
+                TTSAudioChunk(
+                    audio=audio,
+                    text_span=chunk.text_span,
+                    cumulative_duration_ms=cumulative_ms,
+                    sample_rate=chunk.sample_rate,
+                    session_id=chunk.session_id,
+                )
+            )
+        return split_chunks
+
+    async def _send_tts_audio(self, websocket: WebSocket, chunk: TTSAudioChunk) -> None:
+        """Send TTS audio in small frames so clients can start playback sooner."""
+        for outbound_chunk in self._split_tts_audio_chunk(chunk):
+            await self._adapter.send_audio(websocket, outbound_chunk)
+
     async def _llm_generate(self) -> None:
         """Stream LLM response and push text to TTS queue.
 
@@ -450,9 +503,8 @@ class VoiceSession:
         messages = self._conversation.get_messages()
         tools = self._function_executor._registry.tool_schemas if self._function_executor._registry.has_tools else None
 
-        span_id = None
         if self._tracer:
-            span_id = self._tracer.start_span("llm")
+            self._tracer.start_span("llm")
 
         self._current_llm_full_response = ""
         llm_start = time.monotonic() * 1000
@@ -637,6 +689,7 @@ class VoiceSession:
                         if self._tracer:
                             self._tracer.record_event("eibc_to_fsb", {
                                 "eibc_to_fsb_ms": eibc_to_fsb,
+                                "server_eibc_to_fsb_ms": eibc_to_fsb,
                             })
                         logger.info("EIBC→FSB: %.0fms", eibc_to_fsb)
                         self._input_committed_at_ms = 0
@@ -644,7 +697,7 @@ class VoiceSession:
                 self._truncation.record_segment(
                     accumulated_text, audio_chunk.cumulative_duration_ms
                 )
-                await self._adapter.send_audio(websocket, audio_chunk)
+                await self._send_tts_audio(websocket, audio_chunk)
 
             logger.info("TTS: sent %d audio chunks", _chunk_count)
 
@@ -655,6 +708,7 @@ class VoiceSession:
         if self._tracer:
             self._tracer.end_span("tts", {
                 "tts_ttfb_ms": tts_ttfb,
+                "tts_total_latency_ms": time.monotonic() * 1000 - tts_start,
                 "tts_provider": self._config.tts_provider,
                 "text": accumulated_text[:200],
             })
@@ -711,6 +765,7 @@ class VoiceSession:
                             if self._tracer:
                                 self._tracer.record_event("eibc_to_fsb", {
                                     "eibc_to_fsb_ms": eibc_to_fsb,
+                                    "server_eibc_to_fsb_ms": eibc_to_fsb,
                                 })
                             logger.info("EIBC→FSB: %.0fms", eibc_to_fsb)
                             self._input_committed_at_ms = 0
@@ -718,7 +773,7 @@ class VoiceSession:
                     self._truncation.record_segment(
                         text, audio_chunk.cumulative_duration_ms
                     )
-                    await self._adapter.send_audio(websocket, audio_chunk)
+                    await self._send_tts_audio(websocket, audio_chunk)
 
                 logger.info("TTS: sent %d audio chunks for '%s'", _chunk_count, text[:40])
 
@@ -729,6 +784,7 @@ class VoiceSession:
             if self._tracer:
                 self._tracer.end_span("tts", {
                     "tts_ttfb_ms": tts_ttfb,
+                    "tts_total_latency_ms": time.monotonic() * 1000 - tts_start,
                     "tts_provider": self._config.tts_provider,
                     "text": text,
                 })

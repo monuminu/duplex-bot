@@ -13,6 +13,15 @@ EIBC_TO_FSB = "eibc_to_fsb_ms"
 """End of Input Buffer Committed → First Speech Byte.
 The headline metric: full round-trip from user done speaking to agent audio starts."""
 
+SERVER_EIBC_TO_FSB = "server_eibc_to_fsb_ms"
+"""Server-side EIBC → first outbound speech byte."""
+
+SPEECH_END_TO_STT_START = "speech_end_to_stt_start_ms"
+"""Speech segment commit → STT request start."""
+
+FIRST_AUDIO_RECEIVED_TO_PLAYBACK_START = "first_audio_received_to_playback_start_ms"
+"""Browser client first audio frame received → scheduled playback start."""
+
 VAD_SPEECH_ONSET_LATENCY = "vad_speech_onset_latency_ms"
 """Time from audio chunk received to speech-detected event."""
 

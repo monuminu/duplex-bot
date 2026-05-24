@@ -8,7 +8,7 @@ import httpx
 
 from duplex_bot.config import LLMConfig
 from duplex_bot.core.azure_token import AzureTokenProvider
-from duplex_bot.core.events import LLMResponseChunk, ToolCallFragment
+from duplex_bot.core.events import LLMResponseChunk
 from duplex_bot.llm.base import LLMBase
 from openai import AsyncOpenAI
 
@@ -120,7 +120,6 @@ class OpenAIResponsesLLM(LLMBase):
         Tool calls are accumulated and attached to the final chunk.
         """
         instructions, input_list = self._messages_to_input(messages)
-        func_calls: dict[int, ToolCallFragment] = {}
 
         try:
             stream = await self._client.responses.create(
