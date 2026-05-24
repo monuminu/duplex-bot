@@ -31,14 +31,16 @@ router = APIRouter()
 _config: AppConfig | None = None
 _vad_model: SileroVAD | None = None
 _function_registry: FunctionRegistry | None = None
+_eot_classifier = None
 
 
-def configure(config: AppConfig, vad_model: SileroVAD, function_registry: FunctionRegistry | None = None) -> None:
+def configure(config: AppConfig, vad_model: SileroVAD, function_registry: FunctionRegistry | None = None, eot_classifier=None) -> None:
     """Configure the WebSocket routes with shared state."""
-    global _config, _vad_model, _function_registry
+    global _config, _vad_model, _function_registry, _eot_classifier
     _config = config
     _vad_model = vad_model
     _function_registry = function_registry
+    _eot_classifier = eot_classifier
 
 
 def _create_adapter(adapter_name: str) -> TelephonyAdapter:
@@ -116,6 +118,7 @@ async def websocket_endpoint(websocket: WebSocket, adapter_name: str) -> None:
         config=_config,
         function_registry=_function_registry,
         tracer=tracer,
+        eot_classifier=_eot_classifier,
     )
 
     try:

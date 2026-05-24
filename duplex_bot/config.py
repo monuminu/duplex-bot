@@ -53,9 +53,12 @@ class VADConfig(BaseModel):
 
 
 class EndOfTurnConfig(BaseModel):
+    enabled: bool = False
+    detector_type: str = "llm"
     silence_threshold_ms: int = 700
     semantic_check_after_ms: int = 300
     semantic_confidence_threshold: float = 0.7
+    namo_language: str | None = "en"
 
 
 class TTSProviderType(str):

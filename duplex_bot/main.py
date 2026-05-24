@@ -29,20 +29,19 @@ async def lifespan(app: FastAPI):
     await vad_model.load()
     logger.info("Silero VAD model loaded")
 
+    # Load NAMO turn detector at startup (shared across sessions)
+    eot_classifier = None
+    if config.eot.enabled and config.eot.detector_type == "namo":
+        from duplex_bot.llm.namo_turn_detector import NamoSemanticClassifier
+        eot_classifier = NamoSemanticClassifier(language=config.eot.namo_language)
+        await eot_classifier.load()
+        logger.info("NAMO turn detector model loaded")
+
     # Create shared function registry (register your functions here)
     function_registry = FunctionRegistry()
-    # Example:
-    # async def get_weather(city: str) -> dict:
-    #     return {"temperature": 22, "condition": "sunny"}
-    # function_registry.register(
-    #     "get_weather",
-    #     get_weather,
-    #     "Get current weather for a city",
-    #     {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
-    # )
 
     # Configure WebSocket routes with shared state
-    ws.configure(config, vad_model, function_registry)
+    ws.configure(config, vad_model, function_registry, eot_classifier)
 
     logger.info("Duplex Bot ready on %s:%d", config.host, config.port)
     logger.info("WebSocket endpoints:")

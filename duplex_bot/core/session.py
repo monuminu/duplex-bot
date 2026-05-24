@@ -27,7 +27,7 @@ from duplex_bot.core.events import (
 from duplex_bot.core.pipeline import accumulate_sentences, split_sentences
 from duplex_bot.llm.base import LLMBase
 from duplex_bot.llm.function_calling import FunctionExecutor, FunctionRegistry
-from duplex_bot.llm.turn_detector import TurnDetector
+from duplex_bot.llm.turn_detector import LLMSemanticClassifier, TurnDetector
 from duplex_bot.observability.tracer import SessionTracer
 from duplex_bot.stt.base import STTBase
 from duplex_bot.strategies.noise_filter import NoiseFilter
@@ -61,6 +61,7 @@ class VoiceSession:
         config: AppConfig,
         function_registry: FunctionRegistry | None = None,
         tracer: SessionTracer | None = None,
+        eot_classifier=None,
     ):
         self.session_id = session_id
         self._adapter = adapter
@@ -81,7 +82,8 @@ class VoiceSession:
 
         # State
         self._conversation = ConversationHistory(config.system_prompt)
-        self._turn_detector = TurnDetector(llm, config.eot)
+        classifier = eot_classifier if eot_classifier is not None else LLMSemanticClassifier(llm)
+        self._turn_detector = TurnDetector(config.eot, classifier)
         self._noise_filter = NoiseFilter()
         self._truncation = TruncationTracker()
         self._function_executor = FunctionExecutor(function_registry or FunctionRegistry())
@@ -209,7 +211,7 @@ class VoiceSession:
                 if first_byte:
                     tts_ttfb = time.monotonic() * 1000 - tts_start
                     first_byte = False
-                    logger.info(
+                    logger.debug(
                         "Welcome TTS: first audio chunk (TTFB=%.0fms)", tts_ttfb
                     )
                 chunks.append(audio_chunk)
@@ -233,7 +235,7 @@ class VoiceSession:
                 if isinstance(event, AudioChunk):
                     _audio_chunk_count += 1
                     if _audio_chunk_count == 1:
-                        logger.info(
+                        logger.debug(
                             "Session %s: first audio chunk received (%d bytes, %dHz)",
                             self.session_id, len(event.data), event.sample_rate,
                         )
@@ -433,6 +435,11 @@ class VoiceSession:
 
         self._current_llm_task = asyncio.create_task(self._llm_generate())
 
+    
+    async def clean_text(self, text: str) -> str:
+        """Clean LLM output text before sending to TTS."""
+        return text
+    
     async def _llm_generate(self) -> None:
         """Stream LLM response and push text to TTS queue.
 
@@ -464,13 +471,13 @@ class VoiceSession:
                 if chunk.text:
                     full_response += chunk.text
                     self._current_llm_full_response = full_response
-
+                    clearned_chunk = await self.clean_text(chunk.text)
                     if incremental:
-                        await self._tts_text_q.put(chunk.text)
+                        await self._tts_text_q.put(clearned_chunk)
                         await asyncio.sleep(0)
                     else:
                         sentences, sentence_buffer = accumulate_sentences(
-                            sentence_buffer, chunk.text
+                            sentence_buffer, clearned_chunk
                         )
                         for sentence in sentences:
                             await self._tts_text_q.put(sentence)
@@ -478,7 +485,7 @@ class VoiceSession:
 
                 if chunk.is_final:
                     if not incremental and sentence_buffer.strip():
-                        await self._tts_text_q.put(sentence_buffer.strip())
+                        await self._tts_text_q.put(sentence_buffer)
                         sentence_buffer = ""
 
                     if chunk.tool_calls:
@@ -612,9 +619,9 @@ class VoiceSession:
             async for audio_chunk in self._tts_session.synthesize_stream_incremental(
                 _token_stream()
             ):
-                # if self._tts_cancel.is_set():
-                #     logger.info("TTS: cancelled mid-stream after %d chunks", _chunk_count)
-                #     break
+                if self._tts_cancel.is_set():
+                    logger.info("TTS: cancelled mid-stream after %d chunks", _chunk_count)
+                    break
 
                 _chunk_count += 1
                 if first_byte:

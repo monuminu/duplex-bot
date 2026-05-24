@@ -134,7 +134,7 @@
     let mediaStream = null;
     let scriptProcessor = null;
     let playbackQueue = [];
-    let currentSource = null;
+    let scheduledSources = [];
     let nextPlayTime = 0;
     let isBuffering = true;
     const JITTER_BUFFER_SIZE = 3;
@@ -319,17 +319,16 @@
             source.connect(audioContext.destination);
             source.start(nextPlayTime);
             nextPlayTime += buffer.duration;
-            currentSource = source;
-        }
+            scheduledSources.push(source);
 
-        currentSource.onended = () => {
-            if (playbackQueue.length > 0) {
-                drainQueue();
-            } else {
-                currentSource = null;
-                setIndicator('listening');
-            }
-        };
+            source.onended = () => {
+                const idx = scheduledSources.indexOf(source);
+                if (idx !== -1) scheduledSources.splice(idx, 1);
+                if (scheduledSources.length === 0 && playbackQueue.length === 0) {
+                    setIndicator('listening');
+                }
+            };
+        }
     }
 
     function handleControlMessage(msg) {
@@ -338,11 +337,11 @@
                 playbackQueue = [];
                 nextPlayTime = 0;
                 isBuffering = true;
-                if (currentSource) {
-                    currentSource.onended = null;
-                    try { currentSource.stop(); } catch (e) {}
-                    currentSource = null;
+                for (const src of scheduledSources) {
+                    src.onended = null;
+                    try { src.stop(); } catch (e) {}
                 }
+                scheduledSources = [];
                 setIndicator('listening');
                 console.log('Barge-in: playback cleared');
                 break;
@@ -383,11 +382,11 @@
         playbackQueue = [];
         nextPlayTime = 0;
         isBuffering = true;
-        if (currentSource) {
-            currentSource.onended = null;
-            try { currentSource.stop(); } catch (e) {}
-            currentSource = null;
+        for (const src of scheduledSources) {
+            src.onended = null;
+            try { src.stop(); } catch (e) {}
         }
+        scheduledSources = [];
         setIndicator('');
         document.getElementById('connectBtn').disabled = false;
         document.getElementById('disconnectBtn').disabled = true;

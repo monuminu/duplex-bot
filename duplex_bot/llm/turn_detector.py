@@ -3,11 +3,25 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from typing import Protocol, runtime_checkable
 
 from duplex_bot.config import EndOfTurnConfig
 from duplex_bot.llm.base import LLMBase
 
 logger = logging.getLogger(__name__)
+
+
+@runtime_checkable
+class SemanticClassifier(Protocol):
+    async def classify(self, transcript: str, context: list[dict]) -> float: ...
+
+
+class LLMSemanticClassifier:
+    def __init__(self, llm: LLMBase):
+        self._llm = llm
+
+    async def classify(self, transcript: str, context: list[dict]) -> float:
+        return await self._llm.classify_end_of_turn(transcript, context)
 
 
 class TurnDetector:
@@ -16,11 +30,11 @@ class TurnDetector:
     1. Hard silence threshold — if silence exceeds `silence_threshold_ms`,
        the turn is considered complete regardless of semantic analysis.
     2. Semantic classifier — after `semantic_check_after_ms` of silence,
-       ask the LLM to classify whether the user is done speaking.
+       ask a classifier whether the user is done speaking.
     """
 
-    def __init__(self, llm: LLMBase, config: EndOfTurnConfig):
-        self._llm = llm
+    def __init__(self, config: EndOfTurnConfig, classifier: SemanticClassifier):
+        self._classifier = classifier
         self._config = config
         self._accumulated_text: str = ""
         self._last_transcript_time: float = 0
@@ -58,7 +72,7 @@ class TurnDetector:
         # Tier 2: Semantic check after shorter silence
         if silence_ms >= self._config.semantic_check_after_ms:
             try:
-                confidence = await self._llm.classify_end_of_turn(
+                confidence = await self._classifier.classify(
                     self._accumulated_text, context
                 )
                 is_done = confidence >= self._config.semantic_confidence_threshold

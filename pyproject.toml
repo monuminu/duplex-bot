@@ -19,7 +19,8 @@ dependencies = [
     "elevenlabs>=1.9.0",
     "langfuse>=2.50.0",
     "azure-ai-transcription",
-    "openai"
+    "openai",
+    "transformers"
 ]
 
 [project.optional-dependencies]
