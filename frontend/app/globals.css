@@ -1,0 +1,156 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --background: #0a0014;
+  --foreground: #eff6ff;
+  --panel: rgba(6, 14, 34, 0.78);
+  --panel-strong: rgba(8, 20, 44, 0.94);
+  --border: rgba(148, 163, 184, 0.15);
+  --muted: #7dd3fc;
+  --muted-foreground: #93a4bc;
+  --cyan: #00ffff;
+  --magenta: #ff006e;
+  --green: #00ff41;
+  --amber: #ffb000;
+  --radius: 0.5rem;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-border: var(--border);
+  --font-sans: "Space Mono", "IBM Plex Mono", "Avenir Next", monospace;
+  --font-mono: "Space Mono", "IBM Plex Mono", "SFMono-Regular", monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  min-height: 100%;
+  background: #0a0014;
+}
+
+body {
+  min-height: 100vh;
+  margin: 0;
+  overflow-x: hidden;
+  background:
+    radial-gradient(circle at 18% 12%, rgba(255, 0, 110, 0.24), transparent 30rem),
+    radial-gradient(circle at 78% 7%, rgba(0, 255, 255, 0.22), transparent 28rem),
+    linear-gradient(135deg, #0a0014 0%, #020617 48%, #07111f 100%);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+
+body::before {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  pointer-events: none;
+  content: "";
+  opacity: 0.13;
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(255, 255, 255, 0.18) 0,
+    rgba(255, 255, 255, 0.18) 1px,
+    transparent 1px,
+    transparent 4px
+  );
+  mix-blend-mode: screen;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+::selection {
+  background: rgba(0, 255, 255, 0.28);
+  color: white;
+}
+
+.console-panel {
+  border: 1px solid var(--border);
+  background: linear-gradient(180deg, rgba(10, 22, 52, 0.84), rgba(4, 10, 24, 0.92));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 0 60px rgba(0, 255, 255, 0.05);
+}
+
+.neon-cyan {
+  text-shadow: 0 0 18px rgba(0, 255, 255, 0.8);
+}
+
+.neon-magenta {
+  text-shadow: 0 0 18px rgba(255, 0, 110, 0.8);
+}
+
+.wave-field {
+  background:
+    linear-gradient(90deg, transparent 0 49%, rgba(0, 255, 255, 0.16) 50%, transparent 51%),
+    linear-gradient(0deg, transparent 0 49%, rgba(255, 0, 110, 0.12) 50%, transparent 51%);
+  background-size: 34px 34px;
+}
+
+.voice-orb {
+  position: relative;
+  isolation: isolate;
+}
+
+.voice-orb::before,
+.voice-orb::after {
+  position: absolute;
+  inset: -28px;
+  z-index: -1;
+  border: 1px solid rgba(0, 255, 255, 0.22);
+  border-radius: 999px;
+  content: "";
+  animation: orbit-pulse 3.2s ease-in-out infinite;
+}
+
+.voice-orb::after {
+  inset: -52px;
+  border-color: rgba(255, 0, 110, 0.18);
+  animation-delay: 0.8s;
+}
+
+.speaking-bars span {
+  animation: bar-signal 0.9s ease-in-out infinite;
+}
+
+.speaking-bars span:nth-child(2n) {
+  animation-delay: 0.12s;
+}
+
+.speaking-bars span:nth-child(3n) {
+  animation-delay: 0.22s;
+}
+
+@keyframes orbit-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(0.94);
+  }
+  50% {
+    opacity: 0.9;
+    transform: scale(1.03);
+  }
+}
+
+@keyframes bar-signal {
+  0%,
+  100% {
+    transform: scaleY(0.32);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}
