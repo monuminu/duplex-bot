@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import time
+from dataclasses import dataclass
 
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
@@ -36,6 +37,12 @@ from duplex_bot.vad.stream import VADStream, SpeechEnded, SpeechStarted
 logger = logging.getLogger(__name__)
 
 _welcome_audio_cache: dict[str, list[TTSAudioChunk]] = {}
+
+
+@dataclass(frozen=True, slots=True)
+class _TTSTextItem:
+    generation_id: int
+    text: str
 
 
 class VoiceSession:
@@ -74,7 +81,8 @@ class VoiceSession:
         self._audio_in_q: asyncio.Queue[AudioChunk] = asyncio.Queue(maxsize=100)
         self._speech_q: asyncio.Queue[SpeechSegment] = asyncio.Queue()
         self._transcript_q: asyncio.Queue[str] = asyncio.Queue()
-        self._tts_text_q: asyncio.Queue[str] = asyncio.Queue()
+        self._tts_text_q: asyncio.Queue[_TTSTextItem] = asyncio.Queue()
+        self._pending_tts_item: _TTSTextItem | None = None
         self._interrupt_q: asyncio.Queue[InterruptSignal] = asyncio.Queue()
         self._function_result_q: asyncio.Queue[FunctionCallResult] = asyncio.Queue()
 
@@ -92,6 +100,16 @@ class VoiceSession:
         self._current_llm_task: asyncio.Task | None = None
         self._tts_cancel = asyncio.Event()  # Set to cancel in-flight TTS synthesis
         self._shutdown_event = asyncio.Event()
+        self._generation_id = 0
+        self._active_generation_id = 0
+        self._audio_started_generation_id = 0
+        self._pending_user_text: str | None = None
+        self._pending_assistant_generation_id: int | None = None
+        self._user_speech_active = False
+        self._stt_pending_segments = 0
+        self._transcript_pending_turns = 0
+        self._user_input_idle = asyncio.Event()
+        self._user_input_idle.set()
 
         # False positive barge-in resume state
         self._interrupted_full_response: str | None = None
@@ -308,6 +326,8 @@ class VoiceSession:
                     vad_event = await self._vad_stream.process(chunk)
 
                     if isinstance(vad_event, SpeechStarted):
+                        self._user_speech_active = True
+                        self._user_input_idle.clear()
                         # Always send clear when speech is detected
                         vad_event.interrupt.session_id = self.session_id
                         vad_event.interrupt.playback_position_ms = (
@@ -316,9 +336,26 @@ class VoiceSession:
                         await self._interrupt_q.put(vad_event.interrupt)
 
                     elif isinstance(vad_event, SpeechEnded):
+                        self._user_speech_active = False
+                        self._stt_pending_segments += 1
+                        self._refresh_user_input_idle()
                         vad_event.segment.session_id = self.session_id
                         self._input_committed_at_ms = vad_event.segment.committed_at_ms
+                        if (
+                            self._is_agent_speaking
+                            and self._audio_started_generation_id == self._active_generation_id
+                        ):
+                            await self._interrupt_q.put(
+                                InterruptSignal(
+                                    playback_position_ms=self._truncation.current_playback_ms,
+                                    session_id=self.session_id,
+                                )
+                            )
                         await self._speech_q.put(vad_event.segment)
+
+                    elif self._user_speech_active and not self._vad_stream.is_speaking:
+                        self._user_speech_active = False
+                        self._refresh_user_input_idle()
 
                     if span and self._tracer:
                         self._tracer.end_span("vad", {
@@ -344,48 +381,57 @@ class VoiceSession:
 
                 stt_start = time.monotonic() * 1000
                 speech_end_to_stt_start = stt_start - segment.committed_at_ms
-                transcript = await self._stt.transcribe(
-                    segment.audio,
-                    segment.sample_rate,
-                    self._config.azure_stt.language,
-                )
-                stt_latency = time.monotonic() * 1000 - stt_start
-
-                if self._tracer:
-                    self._tracer.end_span("stt", {
-                        "stt_latency_ms": stt_latency,
-                        "speech_end_to_stt_start_ms": speech_end_to_stt_start,
-                        "stt_confidence": transcript.confidence,
-                        "text": transcript.text,
-                    })
-
-                # Signal the false-positive-resume confirmation gate
-                if self._awaiting_stt_after_interrupt:
-                    is_meaningful = (
-                        bool(transcript.text.strip())
-                        and self._noise_filter.is_meaningful(transcript.text)
+                transcript_queued = False
+                try:
+                    transcript = await self._stt.transcribe(
+                        segment.audio,
+                        segment.sample_rate,
+                        self._config.azure_stt.language,
                     )
-                    self._last_stt_was_meaningful = is_meaningful
-                    self._stt_confirmation_event.set()
+                    stt_latency = time.monotonic() * 1000 - stt_start
 
-                if transcript.text.strip():
-                    # Apply noise filter
-                    if self._noise_filter.is_meaningful(transcript.text):
-                        logger.info(
-                            "STT: '%s' (stt=%.0fms, queued=%.0fms)",
-                            transcript.text,
-                            stt_latency,
-                            speech_end_to_stt_start,
+                    if self._tracer:
+                        self._tracer.end_span("stt", {
+                            "stt_latency_ms": stt_latency,
+                            "speech_end_to_stt_start_ms": speech_end_to_stt_start,
+                            "stt_confidence": transcript.confidence,
+                            "text": transcript.text,
+                        })
+
+                    # Signal the false-positive-resume confirmation gate
+                    if self._awaiting_stt_after_interrupt:
+                        is_meaningful = (
+                            bool(transcript.text.strip())
+                            and self._noise_filter.is_meaningful(transcript.text)
                         )
-                        await self._transcript_q.put(transcript.text)
+                        self._last_stt_was_meaningful = is_meaningful
+                        self._stt_confirmation_event.set()
 
-                        # Send transcript to client UI
-                        if self._websocket:
-                            await self._adapter.send_text(
-                                self._websocket, "transcript", transcript.text
+                    if transcript.text.strip():
+                        # Apply noise filter
+                        if self._noise_filter.is_meaningful(transcript.text):
+                            logger.info(
+                                "STT: '%s' (stt=%.0fms, queued=%.0fms)",
+                                transcript.text,
+                                stt_latency,
+                                speech_end_to_stt_start,
                             )
-                    else:
-                        logger.debug("STT filtered as noise: '%s'", transcript.text)
+                            self._transcript_pending_turns += 1
+                            self._refresh_user_input_idle()
+                            transcript_queued = True
+                            await self._transcript_q.put(transcript.text)
+
+                            # Send transcript to client UI
+                            if self._websocket:
+                                await self._adapter.send_text(
+                                    self._websocket, "transcript", transcript.text
+                                )
+                        else:
+                            logger.debug("STT filtered as noise: '%s'", transcript.text)
+                finally:
+                    self._stt_pending_segments = max(0, self._stt_pending_segments - 1)
+                    if not transcript_queued:
+                        self._refresh_user_input_idle()
 
         except asyncio.CancelledError:
             pass
@@ -396,7 +442,8 @@ class VoiceSession:
             while not self._shutdown_event.is_set():
                 try:
                     text = await asyncio.wait_for(
-                        self._transcript_q.get(), timeout=0.1
+                        self._transcript_q.get(),
+                        timeout=self._config.eot.poll_interval_ms / 1000,
                     )
                     self._turn_detector.add_transcript(text)
                 except asyncio.TimeoutError:
@@ -427,11 +474,11 @@ class VoiceSession:
                     self._turn_detector.reset()
 
                     logger.info("Turn complete: '%s'", user_text)
-                    self._conversation.add_user_message(user_text)
+                    self._commit_user_turn(user_text)
 
                     if self._tracer:
                         self._tracer.record_event("user_turn", {
-                            "text": user_text,
+                            "text": self._pending_user_text or user_text,
                             "turn_count": self._conversation.turn_count,
                             "eot_detection_latency_ms": eot_latency,
                             "eot_enabled": self._config.eot.enabled,
@@ -439,9 +486,43 @@ class VoiceSession:
 
                     # Trigger LLM generation
                     await self._generate_response()
+                    self._transcript_pending_turns = max(
+                        0,
+                        self._transcript_pending_turns - 1,
+                    )
+                    self._refresh_user_input_idle()
 
         except asyncio.CancelledError:
             pass
+
+    def _commit_user_turn(self, user_text: str) -> None:
+        """Add or merge a user turn before the assistant has become audible."""
+        if self._should_merge_user_turn():
+            merged = f"{self._pending_user_text} {user_text}".strip()
+            self._pending_user_text = merged
+            self._conversation.update_last_user_message(merged)
+            logger.info("Merged user continuation into pending turn: '%s'", merged)
+            return
+
+        self._pending_user_text = user_text
+        self._conversation.add_user_message(user_text)
+
+    def _should_merge_user_turn(self) -> bool:
+        return (
+            self._pending_user_text is not None
+            and self._active_generation_id > 0
+            and self._audio_started_generation_id != self._active_generation_id
+        )
+
+    def _refresh_user_input_idle(self) -> None:
+        if (
+            self._user_speech_active
+            or self._stt_pending_segments > 0
+            or self._transcript_pending_turns > 0
+        ):
+            self._user_input_idle.clear()
+        else:
+            self._user_input_idle.set()
 
     async def _generate_response(self) -> None:
         """Generate LLM response and stream to TTS."""
@@ -455,7 +536,70 @@ class VoiceSession:
         if self._current_llm_task and not self._current_llm_task.done():
             self._current_llm_task.cancel()
 
-        self._current_llm_task = asyncio.create_task(self._llm_generate())
+        if self._active_generation_id and self._audio_started_generation_id != self._active_generation_id:
+            self._remove_unheard_assistant_message(self._active_generation_id)
+
+        self._tts_cancel.set()
+        self._drain_tts_text_queue()
+
+        self._generation_id += 1
+        generation_id = self._generation_id
+        self._active_generation_id = generation_id
+        self._current_llm_full_response = ""
+        self._tts_cancel.clear()
+
+        self._current_llm_task = asyncio.create_task(self._llm_generate(generation_id))
+
+    def _remove_unheard_assistant_message(self, generation_id: int) -> None:
+        if self._pending_assistant_generation_id == generation_id:
+            self._conversation.remove_last_assistant_message()
+            self._pending_assistant_generation_id = None
+
+    def _drain_tts_text_queue(self) -> None:
+        self._pending_tts_item = None
+        while not self._tts_text_q.empty():
+            try:
+                self._tts_text_q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+    async def _queue_tts_text(self, generation_id: int, text: str) -> None:
+        await self._tts_text_q.put(_TTSTextItem(generation_id=generation_id, text=text))
+
+    async def _get_next_active_tts_item(self) -> _TTSTextItem:
+        while True:
+            if self._pending_tts_item is not None:
+                item = self._pending_tts_item
+                self._pending_tts_item = None
+                if self._is_active_generation(item.generation_id):
+                    return item
+
+            item = await self._tts_text_q.get()
+            if self._is_active_generation(item.generation_id):
+                return item
+            logger.debug(
+                "Dropping stale TTS item for generation %d (active=%d)",
+                item.generation_id,
+                self._active_generation_id,
+            )
+
+    def _is_active_generation(self, generation_id: int) -> bool:
+        return generation_id == self._active_generation_id
+
+    def _mark_generation_audible(self, generation_id: int) -> None:
+        if self._audio_started_generation_id == generation_id:
+            return
+        self._audio_started_generation_id = generation_id
+        self._pending_user_text = None
+        self._pending_assistant_generation_id = None
+
+    async def _wait_for_user_input_idle_before_audio(self, generation_id: int) -> bool:
+        """Hold first assistant audio while VAD/STT may still produce a continuation."""
+        while not self._user_input_idle.is_set():
+            if not self._is_active_generation(generation_id) or self._tts_cancel.is_set():
+                return False
+            await self._user_input_idle.wait()
+        return self._is_active_generation(generation_id) and not self._tts_cancel.is_set()
 
     async def clean_text(self, text: str) -> str:
         """Clean LLM output text before sending to TTS."""
@@ -493,7 +637,7 @@ class VoiceSession:
         for outbound_chunk in self._split_tts_audio_chunk(chunk):
             await self._adapter.send_audio(websocket, outbound_chunk)
 
-    async def _llm_generate(self) -> None:
+    async def _llm_generate(self, generation_id: int) -> None:
         """Stream LLM response and push text to TTS queue.
 
         In "incremental" mode, each token is pushed immediately.
@@ -516,6 +660,8 @@ class VoiceSession:
 
         try:
             async for chunk in self._llm.generate_stream(messages, tools):
+                if not self._is_active_generation(generation_id):
+                    return
                 #logger.info(f"LLM chunk: {chunk.text}")  # Debug: print tokens as they arrive
                 if first_token_at is None and chunk.text:
                     first_token_at = time.monotonic() * 1000
@@ -525,30 +671,33 @@ class VoiceSession:
                     self._current_llm_full_response = full_response
                     clearned_chunk = await self.clean_text(chunk.text)
                     if incremental:
-                        await self._tts_text_q.put(clearned_chunk)
+                        await self._queue_tts_text(generation_id, clearned_chunk)
                         await asyncio.sleep(0)
                     else:
                         sentences, sentence_buffer = accumulate_sentences(
                             sentence_buffer, clearned_chunk
                         )
                         for sentence in sentences:
-                            await self._tts_text_q.put(sentence)
+                            await self._queue_tts_text(generation_id, sentence)
                             await asyncio.sleep(0)
 
                 if chunk.is_final:
                     if not incremental and sentence_buffer.strip():
-                        await self._tts_text_q.put(sentence_buffer)
+                        await self._queue_tts_text(generation_id, sentence_buffer)
                         sentence_buffer = ""
 
                     if chunk.tool_calls:
                         tool_calls = chunk.tool_calls
 
-                    await self._tts_text_q.put("")  # Empty string = done marker
+                    await self._queue_tts_text(generation_id, "")  # Empty string = done marker
 
         except asyncio.CancelledError:
             logger.debug("LLM generation cancelled (barge-in)")
-            await self._tts_text_q.put("")  # Ensure TTS gets done marker
+            await self._queue_tts_text(generation_id, "")  # Ensure TTS gets done marker
             raise
+
+        if not self._is_active_generation(generation_id):
+            return
 
         llm_total = time.monotonic() * 1000 - llm_start
         llm_ttft = (first_token_at - llm_start) if first_token_at else 0
@@ -556,6 +705,8 @@ class VoiceSession:
         # Record assistant response
         if full_response:
             self._conversation.add_assistant_message(full_response)
+            if self._audio_started_generation_id != generation_id:
+                self._pending_assistant_generation_id = generation_id
 
             # Send agent text to client UI
             if self._websocket:
@@ -629,7 +780,9 @@ class VoiceSession:
 
     async def _tts_loop_incremental(self, websocket: WebSocket) -> None:
         """One iteration: stream an entire response through a single TTS session."""
-        first_token = await self._tts_text_q.get()
+        first_item = await self._get_next_active_tts_item()
+        generation_id = first_item.generation_id
+        first_token = first_item.text
 
         if not first_token:
             self._is_agent_speaking = False
@@ -645,16 +798,18 @@ class VoiceSession:
             nonlocal accumulated_text
             yield first_token
             while True:
-                token = await self._tts_text_q.get()
+                item = await self._tts_text_q.get()
+                if item.generation_id != generation_id:
+                    if self._is_active_generation(item.generation_id):
+                        self._pending_tts_item = item
+                    return
+                if not self._is_active_generation(generation_id):
+                    return
+                token = item.text
                 if not token:
                     return
                 if self._tts_cancel.is_set():
-                    while not self._tts_text_q.empty():
-                        try:
-                            if not self._tts_text_q.get_nowait():
-                                break
-                        except asyncio.QueueEmpty:
-                            break
+                    self._drain_tts_text_queue()
                     return
                 accumulated_text += token
                 yield token
@@ -671,12 +826,16 @@ class VoiceSession:
             async for audio_chunk in self._tts_session.synthesize_stream_incremental(
                 _token_stream()
             ):
-                if self._tts_cancel.is_set():
+                if self._tts_cancel.is_set() or not self._is_active_generation(generation_id):
                     logger.info("TTS: cancelled mid-stream after %d chunks", _chunk_count)
                     break
 
                 _chunk_count += 1
                 if first_byte:
+                    if not await self._wait_for_user_input_idle_before_audio(generation_id):
+                        logger.info("TTS: held first audio for pending user input")
+                        break
+                    self._mark_generation_audible(generation_id)
                     tts_ttfb = time.monotonic() * 1000 - tts_start
                     first_byte = False
                     logger.info(
@@ -714,13 +873,16 @@ class VoiceSession:
             })
 
         self._is_agent_speaking = False
-        self._tts_finished_at_ms = time.monotonic() * 1000
+        if self._audio_started_generation_id == generation_id:
+            self._tts_finished_at_ms = time.monotonic() * 1000
 
     # ── sentence mode ───────────────────────────────────────────────
 
     async def _tts_loop_sentence(self, websocket: WebSocket) -> None:
         """Process all sentences for one response over a pooled TTS connection."""
-        text = await self._tts_text_q.get()
+        item = await self._get_next_active_tts_item()
+        generation_id = item.generation_id
+        text = item.text
 
         if not text:
             self._is_agent_speaking = False
@@ -732,7 +894,7 @@ class VoiceSession:
         self._truncation.reset()
 
         while text:
-            if self._tts_cancel.is_set():
+            if self._tts_cancel.is_set() or not self._is_active_generation(generation_id):
                 break
 
             if self._tracer:
@@ -747,12 +909,16 @@ class VoiceSession:
 
             try:
                 async for audio_chunk in self._tts_session.synthesize_stream(text):
-                    if self._tts_cancel.is_set():
+                    if self._tts_cancel.is_set() or not self._is_active_generation(generation_id):
                         logger.info("TTS: cancelled mid-stream after %d chunks", _chunk_count)
                         break
 
                     _chunk_count += 1
                     if first_byte:
+                        if not await self._wait_for_user_input_idle_before_audio(generation_id):
+                            logger.info("TTS: held first audio for pending user input")
+                            break
+                        self._mark_generation_audible(generation_id)
                         tts_ttfb = time.monotonic() * 1000 - tts_start
                         first_byte = False
                         logger.info(
@@ -789,12 +955,17 @@ class VoiceSession:
                     "text": text,
                 })
 
-            if self._tts_cancel.is_set():
+            if self._tts_cancel.is_set() or not self._is_active_generation(generation_id):
                 break
-            text = await self._tts_text_q.get()
+            item = await self._get_next_active_tts_item()
+            if item.generation_id != generation_id:
+                self._pending_tts_item = item
+                break
+            text = item.text
 
         self._is_agent_speaking = False
-        self._tts_finished_at_ms = time.monotonic() * 1000
+        if self._audio_started_generation_id == generation_id:
+            self._tts_finished_at_ms = time.monotonic() * 1000
 
     async def _interrupt_handler(self, websocket: WebSocket) -> None:
         """Handle barge-in interrupts."""
@@ -811,6 +982,16 @@ class VoiceSession:
                     self._tracer.record_event("barge_in", {
                         "playback_position_ms": interrupt.playback_position_ms,
                     })
+
+                generation_pending_audio = (
+                    self._active_generation_id > 0
+                    and self._audio_started_generation_id != self._active_generation_id
+                )
+                if generation_pending_audio:
+                    logger.info(
+                        "User speech detected before assistant audio; holding pending response"
+                    )
+                    continue
 
                 # Cancel any pending false-positive resume from a previous interrupt
                 if self._resume_task and not self._resume_task.done():
@@ -833,11 +1014,7 @@ class VoiceSession:
                     self._current_llm_task.cancel()
 
                 # 4. Drain TTS text queue
-                while not self._tts_text_q.empty():
-                    try:
-                        self._tts_text_q.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
+                self._drain_tts_text_queue()
 
                 # 5. Auto-truncation: update conversation history
                 heard_text = self._truncation.get_heard_text(
@@ -854,7 +1031,12 @@ class VoiceSession:
                     self._tts_finished_at_ms > 0
                     and (time.monotonic() * 1000 - self._tts_finished_at_ms) < 10_000
                 )
-                may_be_speaking = self._is_agent_speaking or recently_finished
+                active_generation_is_audible = (
+                    self._audio_started_generation_id == self._active_generation_id
+                )
+                may_be_speaking = (
+                    self._is_agent_speaking and active_generation_is_audible
+                ) or recently_finished
                 if (self._config.barge_in.false_positive_resume_enabled
                         and may_be_speaking):
                     full_response = (
@@ -872,7 +1054,8 @@ class VoiceSession:
                         self._awaiting_stt_after_interrupt = True
 
                 if heard_text:
-                    self._conversation.truncate_last_assistant(heard_text)
+                    if not self._conversation.truncate_last_assistant(heard_text):
+                        self._conversation.add_assistant_message(heard_text)
                     if self._tracer:
                         self._tracer.record_event("auto_truncation", {
                             "agent_response_heard": heard_text,
@@ -959,9 +1142,10 @@ class VoiceSession:
         self._resume_prefix_text = self._interrupted_heard_text
         self._clear_resume_state()
 
+        generation_id = self._active_generation_id
         for sentence in split_sentences(remaining) or [remaining]:
-            await self._tts_text_q.put(sentence)
-        await self._tts_text_q.put("")
+            await self._queue_tts_text(generation_id, sentence)
+        await self._queue_tts_text(generation_id, "")
 
     def _compute_remaining_text(
         self,

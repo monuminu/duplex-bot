@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 from duplex_bot.config import AppConfig
-from duplex_bot.core.events import AudioChunk, TTSAudioChunk
+from duplex_bot.core.events import AudioChunk, LLMResponseChunk, TTSAudioChunk
 from duplex_bot.core.session import VoiceSession
 from duplex_bot.vad.stream import SpeechEnded, VADStream
 
@@ -47,6 +47,16 @@ class FakeLLM:
 
 
 class FakeTTSSession:
+    async def synthesize_stream_incremental(self, text_stream):
+        async for _ in text_stream:
+            pass
+        if False:
+            yield None
+
+    async def synthesize_stream(self, text: str):
+        if False:
+            yield None
+
     async def close(self) -> None:
         pass
 
@@ -56,17 +66,40 @@ class FakeTTS:
         return FakeTTSSession()
 
 
-def make_session(config: AppConfig | None = None) -> VoiceSession:
+def make_session(config: AppConfig | None = None, llm=None, tts=None) -> VoiceSession:
     config = config or AppConfig(_env_file=None)
     return VoiceSession(
         session_id="test",
         adapter=FakeAdapter(),
         vad_stream=object(),
         stt=FakeSTT(),
-        llm=FakeLLM(),
-        tts=FakeTTS(),
+        llm=llm or FakeLLM(),
+        tts=tts or FakeTTS(),
         config=config,
     )
+
+
+class BlockingLLM(FakeLLM):
+    def __init__(self) -> None:
+        self.calls: list[list[dict]] = []
+        self._release = asyncio.Event()
+
+    async def generate_stream(self, messages: list[dict], tools=None, temperature=None):
+        self.calls.append(messages)
+        await self._release.wait()
+        yield LLMResponseChunk(text="ok", is_final=False)
+        yield LLMResponseChunk(text="", is_final=True)
+
+    def release(self) -> None:
+        self._release.set()
+
+
+async def wait_for_call_count(llm: BlockingLLM, count: int) -> None:
+    for _ in range(20):
+        if len(llm.calls) >= count:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"expected {count} LLM calls, got {len(llm.calls)}")
 
 
 @pytest.mark.asyncio
@@ -172,3 +205,92 @@ def test_tts_audio_chunks_are_split_to_configured_duration() -> None:
 
     assert [len(part.audio) for part in split] == [1024, 1024, 1024, 1024]
     assert [part.cumulative_duration_ms for part in split] == [32, 64, 96, 128]
+
+
+@pytest.mark.asyncio
+async def test_user_continuation_merges_while_llm_pending_before_audio() -> None:
+    llm = BlockingLLM()
+    session = make_session(llm=llm)
+
+    session._commit_user_turn("Sir, I want to apply.")
+    await session._generate_response()
+    await wait_for_call_count(llm, 1)
+
+    session._commit_user_turn("Credit cards, if you can.")
+    await session._generate_response()
+    await wait_for_call_count(llm, 2)
+
+    messages = session._conversation.get_messages()
+    user_messages = [m for m in messages if m["role"] == "user"]
+
+    assert len(user_messages) == 1
+    assert user_messages[0]["content"] == "Sir, I want to apply. Credit cards, if you can."
+    assert llm.calls[1][-1]["content"] == "Sir, I want to apply. Credit cards, if you can."
+
+    if session._current_llm_task:
+        session._current_llm_task.cancel()
+        await asyncio.gather(session._current_llm_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_stale_tts_queue_items_are_discarded() -> None:
+    session = make_session()
+    session._active_generation_id = 2
+
+    await session._queue_tts_text(1, "old")
+    await session._queue_tts_text(2, "new")
+
+    item = await asyncio.wait_for(session._get_next_active_tts_item(), timeout=1)
+
+    assert item.generation_id == 2
+    assert item.text == "new"
+
+
+def test_user_continuation_does_not_merge_after_first_audio_started() -> None:
+    session = make_session()
+    session._pending_user_text = "First turn."
+    session._active_generation_id = 1
+    session._audio_started_generation_id = 1
+    session._conversation.add_user_message("First turn.")
+
+    session._commit_user_turn("Second turn.")
+
+    messages = session._conversation.get_messages()
+    user_messages = [m for m in messages if m["role"] == "user"]
+
+    assert [m["content"] for m in user_messages] == ["First turn.", "Second turn."]
+
+
+@pytest.mark.asyncio
+async def test_first_audio_waits_while_user_input_is_pending() -> None:
+    session = make_session()
+    session._active_generation_id = 1
+    session._user_speech_active = True
+    session._refresh_user_input_idle()
+
+    wait_task = asyncio.create_task(session._wait_for_user_input_idle_before_audio(1))
+    await asyncio.sleep(0)
+
+    assert not wait_task.done()
+
+    session._user_speech_active = False
+    session._refresh_user_input_idle()
+
+    assert await asyncio.wait_for(wait_task, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_first_audio_wait_aborts_when_generation_is_superseded() -> None:
+    session = make_session()
+    session._active_generation_id = 1
+    session._user_speech_active = True
+    session._refresh_user_input_idle()
+
+    wait_task = asyncio.create_task(session._wait_for_user_input_idle_before_audio(1))
+    await asyncio.sleep(0)
+
+    session._active_generation_id = 2
+    session._user_speech_active = False
+    session._refresh_user_input_idle()
+
+    assert not await asyncio.wait_for(wait_task, timeout=1)

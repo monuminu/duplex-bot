@@ -23,12 +23,27 @@ class ConversationHistory:
         self._messages.append({"role": "user", "content": text})
         self._trim_if_needed()
 
+    def update_last_user_message(self, text: str) -> None:
+        """Replace the most recent user message content."""
+        for i in range(len(self._messages) - 1, -1, -1):
+            if self._messages[i]["role"] == "user":
+                self._messages[i]["content"] = text
+                return
+        self.add_user_message(text)
+
     def add_assistant_message(self, text: str) -> None:
         """Add a complete assistant message to the conversation."""
         self._messages.append({"role": "assistant", "content": text})
         self._trim_if_needed()
 
-    def truncate_last_assistant(self, heard_text: str) -> None:
+    def remove_last_assistant_message(self) -> None:
+        """Remove the most recent assistant text message if present."""
+        for i in range(len(self._messages) - 1, -1, -1):
+            if self._messages[i]["role"] == "assistant":
+                self._messages.pop(i)
+                return
+
+    def truncate_last_assistant(self, heard_text: str) -> bool:
         """Replace the last assistant message with only the heard portion.
 
         Called on barge-in: the user only heard part of the response,
@@ -44,8 +59,9 @@ class ConversationHistory:
                         original[:50],
                         heard_text[:50],
                     )
-                return
+                return True
         logger.warning("No assistant message found to truncate")
+        return False
 
     def get_last_assistant_content(self) -> str | None:
         """Return the content of the last assistant message, or None."""

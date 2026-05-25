@@ -45,8 +45,7 @@ class VADConfig(BaseModel):
     sample_rate: int = 16000
     min_speech_duration_ms: int = 300
     max_speech_duration_s: int = 20
-    # Lower values reduce turn latency but can cut off users who pause mid-thought.
-    min_silence_duration_ms: int = 250
+    min_silence_duration_ms: int = 500
     trailing_silence_ms: int = 100
     window_size_samples: int = 512
     speech_pad_ms: int = 200
@@ -59,6 +58,7 @@ class EndOfTurnConfig(BaseModel):
     detector_type: str = "llm"
     silence_threshold_ms: int = 700
     semantic_check_after_ms: int = 300
+    poll_interval_ms: int = 100
     semantic_confidence_threshold: float = 0.7
     namo_language: str | None = "en"
 
