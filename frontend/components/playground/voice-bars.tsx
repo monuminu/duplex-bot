@@ -12,9 +12,9 @@ export function VoiceBars({ active = true, compact = false, className }: VoiceBa
   return (
     <div
       className={cn(
-        "speaking-bars flex items-center justify-center gap-1 text-cyan-300",
+        "speaking-bars flex items-center justify-center gap-1 text-[var(--accent)]",
         compact ? "h-8" : "h-16",
-        !active && "opacity-45",
+        !active && "opacity-40",
         className,
       )}
       aria-hidden="true"
@@ -23,7 +23,7 @@ export function VoiceBars({ active = true, compact = false, className }: VoiceBa
         <span
           key={`${height}-${index}`}
           className={cn(
-            "block w-1 rounded-full bg-current shadow-[0_0_16px_rgba(0,255,255,0.8)]",
+            "block w-1 rounded-full bg-current",
             !active && "[animation-play-state:paused]",
           )}
           style={{ height: compact ? Math.max(8, height / 2) : height }}

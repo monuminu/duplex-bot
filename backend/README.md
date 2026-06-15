@@ -58,6 +58,15 @@ cp .env.example .env
 # Edit .env with your API keys (Azure Speech, LLM, etc.)
 ```
 
+### Local Postgres
+
+Create a local Postgres database and set `DATABASE_URL` in `.env`:
+
+```bash
+DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/duplex_bot
+uv run alembic upgrade head
+```
+
 ### Download VAD Model
 
 ```bash
@@ -79,6 +88,12 @@ The server starts at `http://localhost:8000` with two WebSocket endpoints:
 | `ws://localhost:8000/ws/browser` | Browser client (16kHz PCM + JSON) |
 | `ws://localhost:8000/ws/exotel` | Exotel telephony (8kHz mulaw + JSON events) |
 
+To run a saved voice agent from the browser client, pass its id as a query parameter:
+
+```text
+ws://localhost:8000/ws/browser?agent_id=<voice-agent-id>
+```
+
 ### Frontend Playground
 
 Start the Next.js app from `../frontend`, open `http://localhost:3000/playground`, click
@@ -88,11 +103,15 @@ Start the Next.js app from `../frontend`, open `http://localhost:3000/playground
 ## Configuration
 
 All configuration is via environment variables or `.env` file, using nested delimiter `__` for grouped settings.
+Saved voice agents can override most runtime settings. Blank or `null` agent fields fall back to
+these environment values.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `HOST` | `0.0.0.0` | Server bind address |
 | `PORT` | `8000` | Server port |
+| `DATABASE_URL` | local Postgres URL | Postgres connection string for saved voice agents |
+| `KNOWLEDGE_STORAGE_DIR` | `storage/knowledge_base` | Local file storage root for voice-agent knowledge files |
 | `SYSTEM_PROMPT` | (conversational assistant) | LLM system prompt |
 | `TTS_PROVIDER` | `azure` | TTS backend: `azure` or `elevenlabs` |
 | `TTS_OUTPUT_CHUNK_MS` | `32` | Outbound TTS frame size for lower playback start latency |
@@ -162,9 +181,16 @@ duplex_bot/
 │   ├── truncation.py       # Auto-truncation tracker
 │   └── speculation.py      # Speculative response pre-generation
 └── routes/
+    ├── voice_agents.py     # Voice agent REST API
     ├── ws.py               # WebSocket endpoint /ws/{adapter_name}
     └── health.py           # Health check endpoints
 ```
+
+## Voice Agent API
+
+Voice agents are managed through `/api/voice-agents`. This implementation persists MCP tool
+metadata and uploaded knowledge files for configuration only; MCP execution and file retrieval are
+not wired into live LLM turns yet.
 
 ## Key Metrics (Langfuse)
 

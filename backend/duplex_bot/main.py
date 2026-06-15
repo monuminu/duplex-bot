@@ -4,10 +4,13 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from duplex_bot.config import AppConfig
+from duplex_bot.db.session import init_db
 from duplex_bot.llm.function_calling import FunctionRegistry
-from duplex_bot.routes import health, ws
+from duplex_bot.routes import auth, health, voice_agents, ws
+from duplex_bot.routes.spa import mount_spa
 from duplex_bot.vad.silero import SileroVAD
 
 logging.basicConfig(
@@ -24,6 +27,9 @@ async def lifespan(app: FastAPI):
     config = AppConfig()
     logger.info("Loading configuration...")
 
+    # Zero-config bootstrap: create the database + tables on first boot.
+    init_db()
+
     # Load VAD model (shared across sessions)
     vad_model = SileroVAD()
     await vad_model.load()
@@ -37,7 +43,7 @@ async def lifespan(app: FastAPI):
         await eot_classifier.load()
         logger.info("NAMO turn detector model loaded")
 
-    # Create shared function registry (register your functions here)
+    # Create shared function registry (register process-wide functions here)
     function_registry = FunctionRegistry()
 
     # Configure WebSocket routes with shared state
@@ -55,14 +61,28 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     """Create the FastAPI application."""
+    config = AppConfig()
     app = FastAPI(
         title="Duplex Bot",
-        description="Full-duplex voice agent with cascaded STT → LLM → TTS architecture",
-        version="0.1.0",
+        description="Multi-tenant full-duplex voice agent SaaS (cascaded STT → LLM → TTS)",
+        version="0.2.0",
         lifespan=lifespan,
     )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=config.cors_origin_list,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
     app.include_router(health.router, tags=["health"])
+    app.include_router(auth.router)
+    app.include_router(voice_agents.router)
     app.include_router(ws.router, tags=["websocket"])
+
+    # Serve the built SPA from the same origin so the whole product ships as a
+    # single container. No-op when the frontend build is not present.
+    mount_spa(app, config)
     return app
 
 

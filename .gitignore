@@ -10,6 +10,8 @@ build/
 venv/
 env/
 .env
+.env.local
+.env*.local
 .python-version
 *.onnx
 *.so
@@ -25,3 +27,7 @@ out/
 coverage/
 *.tsbuildinfo
 .playwright-mcp
+backend/storage/
+backend/data/
+backend/frontend_dist/
+data/

@@ -1,0 +1,47 @@
+# One-command local run of the whole product.
+#
+#   docker compose up --build
+#   open http://localhost:8000
+#
+# Zero external dependencies: state persists in the named `voiceagent-data`
+# volume (embedded SQLite + secret key + uploaded files). To scale out to
+# Postgres instead, uncomment the `db` service and DATABASE_URL below.
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - voiceagent-data:/data
+    environment:
+      # Optional platform-default provider keys. Tenants normally set their own
+      # per-agent in the UI, so these can stay empty.
+      - LLM__API_KEY=${LLM__API_KEY:-}
+      - AZURE_SPEECH__SUBSCRIPTION_KEY=${AZURE_SPEECH__SUBSCRIPTION_KEY:-}
+      - ELEVENLABS__API_KEY=${ELEVENLABS__API_KEY:-}
+      # Pin SECRET_KEY in real deployments so JWTs/encrypted secrets survive
+      # redeploys and are shared across replicas.
+      - SECRET_KEY=${SECRET_KEY:-}
+      # --- Scale-out: point at Postgres instead of embedded SQLite ---
+      # - DATABASE_URL=postgresql+psycopg://postgres:postgres@db:5432/duplex_bot
+    restart: unless-stopped
+    # depends_on:
+    #   - db
+
+  # Uncomment to run a Postgres alongside (then set DATABASE_URL above).
+  # db:
+  #   image: postgres:16-alpine
+  #   environment:
+  #     - POSTGRES_DB=duplex_bot
+  #     - POSTGRES_USER=postgres
+  #     - POSTGRES_PASSWORD=postgres
+  #   volumes:
+  #     - pg-data:/var/lib/postgresql/data
+  #   restart: unless-stopped
+
+volumes:
+  voiceagent-data:
+  # pg-data:

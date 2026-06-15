@@ -300,6 +300,7 @@ class AzureTTSSession(TTSSession):
     def __init__(self, tts: AzureSpeechTTS):
         self._tts = tts
         self._synthesizer: speechsdk.SpeechSynthesizer | None = None
+        self._connection: speechsdk.Connection | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._audio_q: asyncio.Queue[TTSAudioChunk | None] | None = None
         self._cumulative_ms = 0.0
@@ -315,6 +316,18 @@ class AzureTTSSession(TTSSession):
             speech_config=config, audio_config=None,
         )
         self._synthesizer.synthesizing.connect(self._on_audio)
+        # Pre-open the WebSocket so the first real synthesis rides a warm
+        # connection. Without this, the first speak_async() pays the full
+        # connect + model warm-up cost, which can exceed the SDK's 2 s
+        # codec-start timeout for slower voices (e.g. DragonHD).
+        try:
+            self._connection = speechsdk.Connection.from_speech_synthesizer(
+                self._synthesizer,
+            )
+            self._connection.open(True)
+            logger.info("Azure TTS session: connection pre-warmed")
+        except Exception as exc:  # noqa: BLE001 - warm-up is best-effort
+            logger.warning("Azure TTS session: pre-warm failed (%s); continuing", exc)
         logger.info("Azure TTS session: synthesizer created (pooled)")
         return self._synthesizer
 
@@ -442,5 +455,11 @@ class AzureTTSSession(TTSSession):
             await fut
 
     async def close(self) -> None:
+        if self._connection is not None:
+            try:
+                self._connection.close()
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+            self._connection = None
         self._synthesizer = None
         logger.info("Azure TTS session: synthesizer released")

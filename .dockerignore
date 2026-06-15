@@ -1,0 +1,31 @@
+# Keep the build context small and avoid leaking local state/secrets.
+
+# Python
+**/__pycache__/
+**/*.pyc
+backend/.venv/
+backend/.pytest_cache/
+backend/.mypy_cache/
+backend/.ruff_cache/
+backend/data/
+backend/storage/
+backend/frontend_dist/
+
+# IMPORTANT: never bake the developer's local .env (it may hold a real DB DSN /
+# provider keys) into the image. The container is zero-config by default.
+**/.env
+**/.env.local
+
+# Node / Next
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
+# VCS / tooling / docs cruft
+.git/
+.gitignore
+**/.DS_Store
+.playwright-mcp/
+.claude/
+*.md
+!backend/README.md

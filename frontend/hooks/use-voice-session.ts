@@ -3,9 +3,24 @@
 import { startTransition, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
+import { getToken } from "@/lib/api";
+
 const SAMPLE_RATE = 16000;
 const JITTER_BUFFER_SIZE = 1;
 export const DEFAULT_MICROPHONE_VALUE = "default";
+
+/**
+ * Resolve the browser-adapter WebSocket URL.
+ *
+ * In the single-container deployment the SPA is served from the same origin as
+ * the backend, so we derive ws(s)://<host>/ws/browser automatically — no env
+ * var needed. NEXT_PUBLIC_BACKEND_WS_URL overrides this for split local dev.
+ */
+function defaultWsUrl(): string {
+  if (typeof window === "undefined") return "ws://localhost:8000/ws/browser";
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.host}/ws/browser`;
+}
 
 export type VoicePhase = "idle" | "listening" | "thinking" | "speaking";
 export type ConnectionStatus = "disconnected" | "connecting" | "connected" | "error";
@@ -28,7 +43,7 @@ type AudioDevice = {
   label: string;
 };
 
-export function useVoiceSession() {
+export function useVoiceSession({ agentId = "" }: { agentId?: string } = {}) {
   const [status, setStatus] = useState<ConnectionStatus>("disconnected");
   const [phase, setPhase] = useState<VoicePhase>("idle");
   const [messages, setMessages] = useState<TranscriptMessage[]>([]);
@@ -241,7 +256,14 @@ export function useVoiceSession() {
     setError("");
     setLatencyMs(null);
 
-    const url = process.env.NEXT_PUBLIC_BACKEND_WS_URL || "ws://localhost:8000/ws/browser";
+    const baseUrl =
+      process.env.NEXT_PUBLIC_BACKEND_WS_URL || defaultWsUrl();
+    const params = new URLSearchParams();
+    if (agentId) params.set("agent_id", agentId);
+    const token = getToken();
+    if (token) params.set("token", token);
+    const query = params.toString();
+    const url = query ? `${baseUrl}${baseUrl.includes("?") ? "&" : "?"}${query}` : baseUrl;
 
     try {
       const audioConstraints: MediaTrackConstraints = {
